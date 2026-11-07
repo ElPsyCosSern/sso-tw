@@ -108,3 +108,28 @@ Node.js 22+，無須安裝 npm 套件：
 參考資料：
 https://developers.line.biz/en/reference/messaging-api/
 https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values/append
+
+
+## Step 5.8.3｜新增後 Sheets 已更新、LINE 沒有回覆
+
+問題特徵：/觀察 能看到新增股票，但 /新增 當下沒有成功或錯誤回覆。可能原因包括 LINE replyToken 在官方 API／Google Sheets 操作後逾時，或 LINE Reply API 本身出錯。**尚未取得 Cloudflare 正式 Logs，不能斷定真正原因。**
+
+新版採最小回覆期限設計：
+1. HMAC、群組白名單、管理員權限檢查照舊。
+2. 新增／移除若在約 5 秒內完成「官方查證、Sheets 寫入、回讀驗證」，仍使用**免費 LINE Reply** 回覆完整成功、已存在或錯誤內容。
+3. 若超過 5 秒，先以**免費 LINE Reply** 告知「已受理、處理中、尚未確認成功」，避免等待所有外部服務後失去 replyToken。寫入仍由 Cloudflare ctx.waitUntil() 進行；請稍後使用 /觀察 確認結果。
+4. LINE Reply API 回 4xx／5xx 時，Cloudflare Log 記錄 line_reply_failed 和 HTTP status；網路例外記錄 line_reply_transport_error。慢速任務結束記錄 watchlist_background_completed（operation、verified/not_verified），不記錄密鑰、LINE 身分 ID、群組 ID、replyToken 或原始訊息內容。
+5. **不自動呼叫 LINE Push API**。Push 會計入每月訊息額度，甚至可能產生費用；此修正不新增付費服務。
+6. Cloudflare ctx.waitUntil() 在 HTTP 回應後最多延續 30 秒，仍可能遇到 CPU 或等待時間限制。如果收到處理中而 /觀察 沒有出現股票，應查 Cloudflare Logs，不要立即連續重試。
+7. 即使 webhook 重送，Google Sheets append 也沒有跨 Worker instance 的原子性；極短時間對同一代號同時操作仍可能重複。此修正沒有新增資料庫、佇列或額外儲存層。
+
+上線驗收：
+- 先備份原 Worker，部署後 LINE 的 /版本 必須顯示 5.8.3。
+- 在已設定管理員的私人群組先用 /觀察 查看原本股票，再用 /新增 已存在代號 檢查應回覆「已在觀察清單」，不要為測試隨意新增不需要的股票。
+- 用真正要新增的股票測試：快則收到「✅ 已新增」；較慢則收到「⏳ 已收到，正在處理」。稍後以 /觀察 確認新增，並檢查 Watchlist 沒有重複。
+- 如果仍無回覆，Cloudflare Dashboard → Workers & Pages → stock-line-bot → Observability / Logs，查該時間附近的 line_reply_failed、line_reply_transport_error、invocation status（例如 exceededCpu）。請提供錯誤類型或狀態碼，不要提供完整 webhook request、密鑰或身分識別資料。
+
+參考：
+https://developers.line.biz/en/reference/messaging-api/
+https://developers.line.biz/en/docs/messaging-api/pricing/
+https://developers.cloudflare.com/workers/runtime-apis/context/

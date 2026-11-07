@@ -64,6 +64,10 @@ async function simulate(command, opts = {}) {
   const config = { ...baseEnv, ...(opts.env ?? {}) };
   const calls = [];
   const replies = [];
+  const timeline = [];
+  const pending = [];
+  let sheetsReadCount = 0;
+  let catalogDelayUsed = false;
   const previousFetch = globalThis.fetch;
   globalThis.fetch = async (requestUrl, options) => {
     const u = new URL(String(requestUrl));
@@ -88,6 +92,10 @@ async function simulate(command, opts = {}) {
     }
     if (u.host === "openapi.twse.com.tw" || u.host === "www.tpex.org.tw") {
       calls.push({ type: "catalog", url: u.href });
+      if (opts.delayCatalogMs && !catalogDelayUsed) {
+        catalogDelayUsed = true;
+        await new Promise((resolve) => setTimeout(resolve, opts.delayCatalogMs));
+      }
       if (opts.catalogUnavailable) {
         return responseJson({ error: "official source unavailable" }, 503);
       }
@@ -135,6 +143,10 @@ async function simulate(command, opts = {}) {
       assert.equal(options.headers.Authorization, "Bearer read-token");
       const ranges = u.searchParams.getAll("ranges");
       calls.push({ type: "read", ranges });
+      sheetsReadCount++;
+      if (sheetsReadCount === 2 && opts.delayVerificationMs) {
+        await new Promise((resolve) => setTimeout(resolve, opts.delayVerificationMs));
+      }
       return responseJson({
         valueRanges: ranges.map((r) => ({
           values: r === "'Watchlist'" || r.startsWith("'Watchlist'!")
@@ -144,6 +156,7 @@ async function simulate(command, opts = {}) {
     }
     if (u.host === "sheets.googleapis.com" && u.pathname.includes("/values/")) {
       calls.push({ type: "write", method: options.method, url: u.href, body: JSON.parse(options.body) });
+      timeline.push("write");
       assert.equal(options.headers.Authorization, "Bearer write-token");
       assert.equal(u.searchParams.get("valueInputOption"), "RAW");
       if (opts.denyWrite) return responseJson({ error: "forbidden" }, 403);
@@ -170,6 +183,10 @@ async function simulate(command, opts = {}) {
     }
     if (u.href === "https://api.line.me/v2/bot/message/reply") {
       assert.equal(options.method, "POST");
+      timeline.push("reply");
+      if (opts.replyStatus && opts.replyStatus !== 200) {
+        return responseJson({ message: "simulated LINE error" }, opts.replyStatus);
+      }
       replies.push(...JSON.parse(options.body).messages.map((m) => m.text));
       return responseJson({});
     }
@@ -178,9 +195,12 @@ async function simulate(command, opts = {}) {
   try {
     const response = await worker.fetch(signedRequest(
       command, opts.userId === undefined ? adminId : opts.userId, opts.group ?? groupId
-    ), config);
+    ), config, {
+      waitUntil: (promise) => { pending.push(promise); },
+    });
     assert.equal(response.status, 200);
-    return { rows, calls, replies, text: replies.join("\n") };
+    if (pending.length) await Promise.all(pending);
+    return { rows, calls, replies, timeline, text: replies.join("\n") };
   } finally {
     globalThis.fetch = previousFetch;
   }
@@ -355,7 +375,7 @@ test("/新增 writes no formulas, score or existing signal rows", async () => {
 
 test("/版本 identifies deployed Worker source without Google calls", async () => {
   const { text, calls } = await simulate("/版本");
-  assert.match(text, /5\.8\.2/);
+  assert.match(text, /5\.8\.3/);
   assert.equal(calls.length, 0);
 });
 
@@ -523,4 +543,51 @@ test("invalid alphanumeric stock IDs fail closed before Sheets reads", async () 
     assert.match(result.text, /用法/);
     assert.equal(result.calls.length, 0);
   }
+});
+
+
+test("/新增 sends an early free LINE acknowledgement when Sheets verification is slow", async () => {
+  // Reproduces: the new stock row was committed, but read-back took long
+  // enough that LINE didn't receive the old final reply.
+  const result = await simulate("/新增 00685L", {
+    delayVerificationMs: 5200,
+  });
+  assert.deepEqual(result.rows.at(-1), ["00685L", "群益臺灣加權正2", "ETF", "TRUE"]);
+  assert.equal(result.replies.length, 1);
+  assert.match(result.text, /已收到 \/新增 00685L/);
+  assert.match(result.text, /不代表寫入成功/);
+  assert.match(result.text, /\/觀察/);
+  assert.deepEqual(result.timeline, ["write", "reply"]);
+});
+
+test("/新增 fast path still replies with verified success, not an unverified acknowledgement", async () => {
+  const result = await simulate("/新增 00685L");
+  assert.match(result.text, /^✅ 00685L/);
+  assert.doesNotMatch(result.text, /⏳/);
+  assert.deepEqual(result.timeline, ["write", "reply"]);
+});
+
+test("failed LINE Reply is observable, without undoing an already verified Sheets write", async () => {
+  const logs = [];
+  const oldLog = console.error;
+  console.error = (...args) => logs.push(args);
+  try {
+    const result = await simulate("/新增 00685L", { replyStatus: 400 });
+    assert.equal(result.replies.length, 0);
+    assert.deepEqual(result.rows.at(-1), ["00685L", "群益臺灣加權正2", "ETF", "TRUE"]);
+    assert.deepEqual(result.timeline, ["write", "reply"]);
+    assert.ok(logs.some((entry) => entry[0] === "line_reply_failed" &&
+      entry[1]?.status === 400));
+    assert.doesNotMatch(JSON.stringify(logs), /line-access-token|mock-reply-token|test-line-secret/);
+  } finally {
+    console.error = oldLog;
+  }
+});
+
+test("slow rejected admin operation replies pending instead of asserting success", async () => {
+  const result = await simulate("/新增 0000", { delayCatalogMs: 5200 });
+  assert.match(result.text, /已收到 \/新增 0000/);
+  assert.match(result.text, /不代表寫入成功/);
+  assert.equal(result.calls.filter((call) => call.type === "write").length, 0);
+  assert.deepEqual(result.rows, original);
 });

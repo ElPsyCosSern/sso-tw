@@ -1088,7 +1088,9 @@ async function replyToLine(env, replyToken, message) {
       texts.some((text) => typeof text !== "string" || !text || text.length > 4900)) {
     throw new Error("LINE response length/count invalid");
   }
-  const response = await fetch("https://api.line.me/v2/bot/message/reply", {
+  let response;
+  try {
+    response = await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -1099,12 +1101,35 @@ async function replyToLine(env, replyToken, message) {
       messages: texts.map((text) => ({ type: "text", text })),
     }),
     signal: AbortSignal.timeout(8000),
+    });
+  } catch (error) {
+    console.error("line_reply_transport_error", { name: error?.name || "Error" });
+    return false;
+  }
+  if (!response.ok) {
+    // Never log reply tokens, group IDs or message bodies.
+    console.error("line_reply_failed", { status: response.status });
+    return false;
+  }
+  return true;
+}
+
+// Prefer a final free Reply when operations finish quickly. For slow Google
+// operations, consume the reply token early with an explicitly pending notice.
+// Do not send a billable LINE Push or imply the Watchlist changed.
+const WATCHLIST_REPLY_BUDGET_MS = 5000;
+async function startWatchlistCommand(work) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), WATCHLIST_REPLY_BUDGET_MS);
   });
-  if (!response.ok) console.error("LINE Reply API failed:", response.status);
+  const result = await Promise.race([work, timeout]);
+  clearTimeout(timer);
+  return result;
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const path = new URL(request.url).pathname;
     if (request.method === "GET" && path === "/") {
       return new Response("LINE Webhook Ready");
@@ -1142,6 +1167,7 @@ export default {
       const groupId = event.source.groupId;
       const allowedGroupId = (env.LINE_ALLOWED_GROUP_ID || "").trim();
       let message = null;
+      let backgroundWrite = null;
 
       if (command === "/群組ID" && !allowedGroupId) {
         message = "群組 ID：" + groupId + "\n請妥善保存，不要公開分享。";
@@ -1149,7 +1175,7 @@ export default {
         if (command === "/測試") {
           message = "✅ LINE 機器人連線成功！";
         } else if (command === "/版本") {
-          message = "🛠️ stock-line-bot／5.8.2（上櫃、興櫃及英文尾碼支援）";
+          message = "🛠️ stock-line-bot／5.8.3（LINE 新增回覆修正）";
         } else if (command === "/我的ID") {
           message = event.source.userId
             ? "🔐 你的 LINE User ID：" + event.source.userId +
@@ -1171,12 +1197,31 @@ export default {
           } else if (!isWatchlistAdmin(env, event.source.userId)) {
             message = "⛔ 只有已設定的管理員可以修改觀察清單。";
           } else {
-            try {
-              message = await changeWatchlist(
-                env, isAdd ? "add" : "remove", match[1].toUpperCase(), match[2] || "", match[3] || ""
-              );
-            } catch {
-              message = "⚠️ Watchlist 更新或回讀驗證失敗，請先用 /觀察 確認資料，再決定是否重試。";
+            const operation = isAdd ? "add" : "remove";
+            const operationText = isAdd ? "新增" : "移除";
+            const ticker = match[1].toUpperCase();
+            const work = changeWatchlist(
+              env, operation, ticker, match[2] || "", match[3] || ""
+            ).catch((error) => {
+              console.error("watchlist_write_or_verify_failed", {
+                operation, errorName: error?.name || "Error",
+              });
+              return "⚠️ Watchlist 更新或回讀驗證失敗，請先用 /觀察 確認資料，再決定是否重試。";
+            });
+            const settled = await startWatchlistCommand(work);
+            if (settled === null) {
+              message = "⏳ 已收到 /" + operationText + " " + ticker +
+                "，資料仍在確認與更新中。\n" +
+                "這不代表寫入成功，請稍後輸入 /觀察 檢查實際結果；" +
+                "若沒有變更，請查看 Cloudflare Logs 後再重試。";
+              backgroundWrite = work.then((outcome) => {
+                console.info("watchlist_background_completed", {
+                  operation,
+                  result: outcome.startsWith("✅") ? "verified" : "not_verified",
+                });
+              });
+            } else {
+              message = settled;
             }
           }
         } else if (
@@ -1250,7 +1295,16 @@ export default {
           }
         }
       }
+      // Let slow Google writes finish after an early free LINE Reply.
+      // Cloudflare waitUntil has a bounded lifetime; no paid push is used.
+      if (backgroundWrite && typeof ctx?.waitUntil === "function") {
+        ctx.waitUntil(backgroundWrite);
+      }
       if (message) await replyToLine(env, event.replyToken, message);
+      // Tests / non-Cloudflare adapters without ExecutionContext await writes.
+      if (backgroundWrite && typeof ctx?.waitUntil !== "function") {
+        await backgroundWrite;
+      }
     }
 
     return new Response("OK", { status: 200 });
