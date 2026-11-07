@@ -2,9 +2,24 @@
 
 本 Worker 連接 LINE 私人群組和 Google Sheets。原有研究報告查詢維持唯讀，只有指定 LINE 管理員可以新增／移除 Watchlist 股票。
 
-**目前功能分支版本：5.8.5（Webhook 499 快速 HTTP 200 修正）**。下方 5.8.3／5.8.4 為歷史變更紀錄，正式部署應使用最新固定 Commit。
+**目前功能分支版本：5.8.6（LINE 手動分析與狀態查詢）**。下方 5.8.3／5.8.4 為歷史變更紀錄，正式部署應使用最新固定 Commit。
 
 **狀態**：本版本程式與模擬測試已完成；正式 Cloudflare 仍須手動備份、部署和驗收。本版本不會自行修改線上 Worker、真實試算表或 GitHub 排程。
+
+## Step 5.8.6｜LINE 管理員手動選股分析
+
+- 指定群組管理員輸入 /分析：Worker 查詢既有工作流程；有工作排隊或執行中時拒絕重複提交；否則使用 workflow_dispatch 在 feat/line-sheets-integration 分支執行 daily.yml，validate_only=false。會讀取 Watchlist 所有啟用股票。
+- /分析狀態：查最新手動執行工作的狀態、成功/失敗、台灣時間及 GitHub 執行網址，不會重新執行。
+- 兩指令沿用 LINE HMAC、允許群組及 LINE_ADMIN_USER_IDS 管理員白名單，不能從 LINE 指定任意儲存庫、工作流程、分支或參數。
+- 使用 GitHub 讀取及提交前檢查，搭配 Worker 單執行個體的 90 秒冷卻時間；這不是跨 Worker 執行個體的原子鎖。GitHub Actions 既有 concurrency group 可排隊同分支工作，請勿短時間重複發送。
+- Cloudflare 必須新增 Secret GITHUB_ACTIONS_TOKEN。推薦 GitHub Fine-grained personal access token：Resource owner ElPsyCosSern、Repository access 選 Only select repositories → sso-tw，Repository permissions：Actions Read and write，其他保持最小（Metadata Read 為必要）。請設定到期日，切勿貼在聊天、原始碼、LINE 或普通 Variable。
+- **上線前提：** GitHub Actions daily.yml 必須在 main（預設分支）註冊後才能透過 API dispatch；功能分支有檔案不代表已註冊。為避免意外開啟每日排程，main 上用於註冊的工作流程應只包含 workflow_dispatch，不包含 schedule。實際運算固定選 feat/line-sheets-integration。
+- GitHub Secrets FINMIND_TOKEN、GOOGLE_SHEET_ID、GOOGLE_CREDS_JSON 已是現有設定，應保留在 GitHub。不要把這三份 Secret 帶到 LINE。
+- GitHub 接受 dispatch 不等於分析成功；先用 /分析狀態 查 GitHub run，再用 /選股 確認 Reports 和 Signals 的 run_id 與行情日期；ETF／興櫃維持風險防護，休市可能 stale/partial。
+- GitHub API 回傳 401、403、404、422、逾時時，LINE 會回覆錯誤，不會偽稱分析成功。Webhook 仍先快速 HTTP 200，再於 waitUntil 進行 GitHub 查詢。
+
+正式驗收：LINE /版本 顯示 5.8.6；/分析狀態 回覆合理；/分析 只啟動一次；GitHub Actions 必須顯示 feat/line-sheets-integration；完成後檢查 Google Sheets Signals/Reports 與 LINE /選股。模擬測試通過不等於正式部署已完成。
+
 
 ## LINE 指令
 
@@ -21,6 +36,8 @@
 | /新增 1260 | 群組管理員 | 興櫃股票：富味鄉／興櫃／食品 |
 | /新增 2882 國泰金 金融 | 群組管理員 | 保留手動指定名稱與類股的備用方式 |
 | /移除 2882 | 群組管理員 | 設 enabled=FALSE，不刪除任何分析紀錄 |
+| /分析 | 群組管理員 | 手動觸發已啟用 Watchlist 的 V3 Daily Signal 分析，不表示立即完成 |
+| /分析狀態 | 群組管理員 | 查詢最新功能分支的手動選股 GitHub Actions 狀態 |
 | /我的ID | 指定群組 | 顯示發話者 User ID，供管理員首次設定 |
 | /選股、/個股 2330、/績效 | 指定群組 | 既有選股、個股、績效查詢 |
 | /總覽、/建議、/量價、/夜盤、/盤前 | 指定群組 | 既有研究與夜盤報告 |

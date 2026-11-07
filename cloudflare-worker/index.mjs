@@ -2,7 +2,7 @@
  * stock-line-bot — Step 5-7 original research report integration
  *
  * Existing /測試, /群組ID, /資料測試, /選股, /個股, /績效, /觀察
- * Admin-only /新增, /移除; setup command /我的ID and /版本 (allowed group only)
+ * Admin-only /新增, /移除, /分析, /分析狀態; /我的ID and /版本 (allowed group only)
  * New /總覽, /建議, /量價, /夜盤, /盤前, /完整報告, /報告 N, /功能
  * All commands are confined to a signed, whitelisted LINE private group.
  *
@@ -1187,6 +1187,212 @@ async function checkLineSignature(rawBody, signature, secret) {
   );
 }
 
+
+// The target is fixed server-side; LINE commands cannot select arbitrary
+// repositories, workflows, refs, or workflow_dispatch inputs.
+const ANALYSIS_REPO = "ElPsyCosSern/sso-tw";
+const ANALYSIS_BRANCH = "feat/line-sheets-integration";
+const ANALYSIS_WORKFLOW = "daily.yml";
+const ANALYSIS_API = "https://api.github.com/repos/" + ANALYSIS_REPO +
+  "/actions/workflows/" + ANALYSIS_WORKFLOW;
+const ANALYSIS_ACTIVE = new Set(["requested", "waiting", "pending", "queued", "in_progress"]);
+let analysisDispatchInFlight = false;
+let analysisLastDispatchAt = 0;
+
+function githubAnalysisErrorMessage(error, verb) {
+  const status = Number(error?.status);
+  if (error?.code === "token_missing") {
+    return "⛔ 尚未設定 Cloudflare Secret GITHUB_ACTIONS_TOKEN，" +
+      verb + "功能目前停用。";
+  }
+  if (status === 401 || status === 403) {
+    return "⛔ GitHub API 驗證或 Actions 權限不足（HTTP " + status +
+      "）。請檢查 Token 是否過期、是否限於正確 Repository，以及 Actions Read/Write 權限。";
+  }
+  if (status === 404) {
+    return "⚠️ GitHub 找不到 V3 Daily Signal（HTTP 404）。" +
+      "工作流程可能尚未在預設分支註冊，或 Token 無權存取。" +
+      "\n目前不會啟動分析，請先在 GitHub Actions 確認 daily.yml 已註冊。";
+  }
+  if (status === 422) {
+    return "⚠️ GitHub 拒絕分析請求（HTTP 422），請檢查功能分支與 workflow_dispatch 設定。";
+  }
+  if (status === 409) {
+    return "⚠️ GitHub 工作流程目前不可執行（HTTP 409）。請確認是否停用。";
+  }
+  return "⚠️ GitHub " + verb + "失敗" +
+    (Number.isInteger(status) && status > 0 ? "（HTTP " + status + "）" : "") +
+    "。未確認工作流程狀態，請查看 GitHub Actions 再決定是否重試。";
+}
+
+async function githubAnalysisRequest(env, method, suffix, body = null) {
+  const token = String(env.GITHUB_ACTIONS_TOKEN || "").trim();
+  if (!token) {
+    const error = new Error("GitHub Actions token not configured");
+    error.code = "token_missing";
+    throw error;
+  }
+  if (!["GET", "POST"].includes(method) ||
+      !["/runs?per_page=50", "/dispatches"].includes(suffix)) {
+    throw new Error("Unsupported GitHub API operation");
+  }
+  let response;
+  try {
+    response = await fetch(ANALYSIS_API + suffix, {
+      method,
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: "Bearer " + token,
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "sso-tw-line-bot",
+        ...(body ? { "Content-Type": "application/json" } : {}),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch (error) {
+    const wrapped = new Error("GitHub API transport error");
+    wrapped.code = "transport";
+    throw wrapped;
+  }
+  if (!response.ok) {
+    // Do not log response bodies; a third-party error may contain sensitive data.
+    const error = new Error("GitHub Actions request rejected");
+    error.status = response.status;
+    throw error;
+  }
+  if (method === "POST") {
+    // A dispatch acknowledgement does NOT mean the run has completed.
+    if (![200, 204].includes(response.status)) {
+      throw new Error("Unexpected GitHub dispatch response");
+    }
+    return null;
+  }
+  try {
+    const data = await response.json();
+    if (!Array.isArray(data?.workflow_runs)) throw new Error("Invalid workflow runs");
+    return data.workflow_runs;
+  } catch {
+    throw new Error("Invalid GitHub workflow runs payload");
+  }
+}
+
+function analysisRunUrl(run) {
+  const id = Number(run?.id);
+  return Number.isSafeInteger(id) && id > 0
+    ? "https://github.com/" + ANALYSIS_REPO + "/actions/runs/" + id
+    : "https://github.com/" + ANALYSIS_REPO + "/actions";
+}
+
+function analysisTime(value) {
+  const timestamp = Date.parse(value || "");
+  if (!Number.isFinite(timestamp)) return "未知";
+  return new Intl.DateTimeFormat("zh-TW", {
+    timeZone: "Asia/Taipei", year: "numeric", month: "2-digit",
+    day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+  }).format(new Date(timestamp)) + "（台灣時間）";
+}
+
+function analysisStatusLabel(run) {
+  const status = String(run?.status || "");
+  if (status === "completed") {
+    const conclusion = String(run?.conclusion || "");
+    return ({
+      success: "✅ 執行成功", failure: "❌ 執行失敗",
+      cancelled: "⏹️ 已取消", timed_out: "⏰ 執行逾時",
+      skipped: "⚪ 已略過", action_required: "⚠️ 需要人工處理",
+    })[conclusion] || "⚠️ 已結束（" + safeCell(conclusion || "結果未知", 30) + "）";
+  }
+  return ({
+    queued: "⏳ 排隊中", in_progress: "🔄 執行中",
+    waiting: "⏳ 等待中", pending: "⏳ 待處理",
+    requested: "⏳ 已收到執行要求",
+  })[status] || "⚠️ 未知執行狀態";
+}
+
+function latestAnalysisRun(runs) {
+  return [...runs]
+    .filter((run) =>
+      run && run.head_branch === ANALYSIS_BRANCH &&
+      run.event === "workflow_dispatch")
+    .sort((a, b) =>
+      Date.parse(b.created_at || "") - Date.parse(a.created_at || "") ||
+      Number(b.id || 0) - Number(a.id || 0))[0] || null;
+}
+
+async function analysisStatusMessage(env) {
+  try {
+    const runs = await githubAnalysisRequest(env, "GET", "/runs?per_page=50");
+    const run = latestAnalysisRun(runs);
+    if (!run) {
+      return "📭 目前查不到功能分支的手動選股執行紀錄。" +
+        "\n這不代表已有新分析；請先確認 GitHub Actions 工作流程是否可使用。";
+    }
+    return [
+      "📊 V3 Daily Signal｜分析狀態",
+      "分支：" + ANALYSIS_BRANCH,
+      "狀態：" + analysisStatusLabel(run),
+      "開始要求：" + analysisTime(run.created_at),
+      ...(run.status === "completed"
+        ? ["完成時間：" + analysisTime(run.updated_at)] : []),
+      "執行紀錄：" + analysisRunUrl(run),
+      "⚠️ GitHub 執行成功不代表行情為當日有效；請用 /選股 確認報告資料日期。",
+    ].join("\n");
+  } catch (error) {
+    console.error("analysis_status_query_failed", {
+      status: Number(error?.status) || null,
+      name: error?.name || "Error",
+    });
+    return githubAnalysisErrorMessage(error, "查詢狀態");
+  }
+}
+
+async function analysisDispatchMessage(env) {
+  if (!String(env.GITHUB_ACTIONS_TOKEN || "").trim()) {
+    return githubAnalysisErrorMessage({ code: "token_missing" }, "啟動分析");
+  }
+  // In-isolate guard only; GitHub workflow state and concurrency provide
+  // best-effort protection, not a cross-isolate atomic distributed lock.
+  if (analysisDispatchInFlight ||
+      (analysisLastDispatchAt && Date.now() - analysisLastDispatchAt < 90000)) {
+    return "⏳ 最近已提交分析要求，請使用 /分析狀態 查看進度，避免重複觸發。";
+  }
+  analysisDispatchInFlight = true;
+  try {
+    const runs = await githubAnalysisRequest(env, "GET", "/runs?per_page=50");
+    const active = runs.find((run) => ANALYSIS_ACTIVE.has(String(run?.status || "")));
+    if (active) {
+      return [
+        "⏳ V3 Daily Signal 已有工作正在執行或排隊，不重複提交。",
+        "狀態：" + analysisStatusLabel(active),
+        "執行紀錄：" + analysisRunUrl(active),
+        "請稍後輸入 /分析狀態。",
+      ].join("\n");
+    }
+    await githubAnalysisRequest(env, "POST", "/dispatches", {
+      ref: ANALYSIS_BRANCH,
+      inputs: { validate_only: "false" },
+    });
+    analysisLastDispatchAt = Date.now();
+    return [
+      "✅ GitHub 已接受選股分析啟動要求（尚非分析完成）。",
+      "範圍：Watchlist 所有啟用股票",
+      "執行分支：" + ANALYSIS_BRANCH,
+      "請輸入 /分析狀態 查看 GitHub Actions 進度。",
+      "完成後以 /選股、/完整報告 查看更新結果及行情日期。",
+      "⚠️ 休市或資料過期時，訊號可能標記為 stale／partial。",
+    ].join("\n");
+  } catch (error) {
+    console.error("analysis_dispatch_failed", {
+      status: Number(error?.status) || null,
+      name: error?.name || "Error",
+    });
+    return githubAnalysisErrorMessage(error, "啟動分析");
+  } finally {
+    analysisDispatchInFlight = false;
+  }
+}
+
 async function replyToLine(env, replyToken, message) {
   const texts = Array.isArray(message) ? message : [message];
   if (!texts.length || texts.length > 5 ||
@@ -1284,12 +1490,24 @@ export default {
         if (command === "/測試") {
           message = "✅ LINE 機器人連線成功！";
         } else if (command === "/版本") {
-          message = "🛠️ stock-line-bot／5.8.5（Webhook 快速回應修正）";
+          message = "🛠️ stock-line-bot／5.8.6（LINE 分析與狀態查詢）";
         } else if (command === "/我的ID") {
           message = event.source.userId
             ? "🔐 你的 LINE User ID：" + event.source.userId +
               "\n請勿轉傳此個人識別碼；將它設定為 Cloudflare Secret：LINE_ADMIN_USER_IDS。"
             : "⚠️ LINE 沒有提供你的 User ID，無法建立編輯權限。請改用 LINE 手機版發送此指令。";
+        } else if (command === "/分析" || command === "/分析狀態") {
+          if (!String(env.LINE_ADMIN_USER_IDS || "").trim()) {
+            message = "⛔ 尚未設定管理員白名單，分析指令維持停用。";
+          } else if (!event.source.userId) {
+            message = "⛔ LINE 未提供 User ID，無法確認管理員身分。";
+          } else if (!isWatchlistAdmin(env, event.source.userId)) {
+            message = "⛔ 只有已授權的管理員可以啟動或查詢分析工作。";
+          } else {
+            message = command === "/分析"
+              ? await analysisDispatchMessage(env)
+              : await analysisStatusMessage(env);
+          }
         } else if (command.startsWith("/新增") || command.startsWith("/移除")) {
           const isAdd = command.startsWith("/新增");
           const match = isAdd
@@ -1388,6 +1606,8 @@ export default {
                 "/觀察、/績效、/資料測試－既有查詢\n" +
                 "/新增 2882／00685L－自動辨識及啟用（管理員）\n" +
                 "/移除 2882－停用但保留歷史（管理員）\n" +
+                "/分析－觸發 GitHub 選股分析（管理員）\n" +
+                "/分析狀態－查詢 GitHub 執行進度（管理員）\n" +
                 "/我的ID－取得管理員設定用 User ID\n" +
                 "/版本－確認 Worker 是否已更新\n" +
                 "僅供研究參考，所有行情日期請以回覆標示為準。";

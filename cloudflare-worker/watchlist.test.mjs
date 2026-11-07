@@ -180,6 +180,41 @@ async function simulate(command, opts = {}) {
       }
       return responseJson({ msg: "success", status: 200, data });
     }
+    if (u.host === "api.github.com") {
+      assert.equal(u.pathname.startsWith(
+        "/repos/ElPsyCosSern/sso-tw/actions/workflows/daily.yml/"), true);
+      assert.equal(options.headers.Accept, "application/vnd.github+json");
+      assert.equal(options.headers.Authorization, "Bearer github-test-token");
+      assert.equal(options.headers["X-GitHub-Api-Version"], "2022-11-28");
+      if (opts.githubDelayMs) {
+        await new Promise((resolve) => setTimeout(resolve, opts.githubDelayMs));
+      }
+      if (u.pathname.endsWith("/runs")) {
+        assert.equal(options.method, "GET");
+        assert.equal(u.searchParams.get("per_page"), "50");
+        calls.push({ type: "github-read" });
+        if (opts.githubGetStatus) {
+          return responseJson({ message: "simulated GitHub GET error" }, opts.githubGetStatus);
+        }
+        return responseJson(opts.githubMalformed
+          ? { invalid: true }
+          : { workflow_runs: structuredClone(opts.workflowRuns ?? []) });
+      }
+      if (u.pathname.endsWith("/dispatches")) {
+        assert.equal(options.method, "POST");
+        const submitted = JSON.parse(options.body);
+        assert.deepEqual(submitted, {
+          ref: "feat/line-sheets-integration",
+          inputs: { validate_only: "false" },
+        });
+        calls.push({ type: "github-dispatch", payload: submitted });
+        if (opts.githubPostStatus) {
+          return responseJson({ message: "simulated GitHub POST error" }, opts.githubPostStatus);
+        }
+        return new Response(null, { status: 204 });
+      }
+      throw new Error("Unrecognized GitHub endpoint");
+    }
     if (u.host === "sheets.googleapis.com" && u.pathname.endsWith("/values:batchGet")) {
       assert.equal(options.method, "GET");
       assert.equal(options.headers.Authorization, "Bearer read-token");
@@ -262,6 +297,14 @@ async function simulate(command, opts = {}) {
   } finally {
     globalThis.fetch = previousFetch;
   }
+}
+
+function githubRun(id, status = "completed", conclusion = "success", extra = {}) {
+  return {
+    id, status, conclusion, head_branch: "feat/line-sheets-integration",
+    event: "workflow_dispatch", created_at: "2026-11-08T00:01:00Z",
+    updated_at: "2026-11-08T00:04:00Z", ...extra,
+  };
 }
 
 test("/我的ID returns own LINE User ID in the allowed group without Google access", async () => {
@@ -433,7 +476,7 @@ test("/新增 writes no formulas, score or existing signal rows", async () => {
 
 test("/版本 identifies deployed Worker source without Google calls", async () => {
   const { text, calls } = await simulate("/版本");
-  assert.match(text, /5\.8\.5/);
+  assert.match(text, /5\.8\.6/);
   assert.equal(calls.length, 0);
 });
 
@@ -784,4 +827,100 @@ test("malformed signed Webhook JSON is 400 without scheduling processing", async
   });
   assert.equal(response.status, 400);
   assert.equal(pending.length, 0);
+});
+
+test("/分析 dispatches the fixed feature branch only for an authorized admin", async () => {
+  const result = await simulate("/分析", {
+    fresh: "analysis-dispatch-ok",
+    env: { GITHUB_ACTIONS_TOKEN: "github-test-token" },
+  });
+  assert.match(result.text, /已接受選股分析啟動要求/);
+  assert.match(result.text, /尚非分析完成/);
+  assert.equal(result.calls.filter((c) => c.type === "github-read").length, 1);
+  assert.equal(result.calls.filter((c) => c.type === "github-dispatch").length, 1);
+  assert.equal(result.calls.filter((c) => c.type === "write").length, 0);
+});
+
+test("/分析 uses existing admin/group whitelist and rejects other users", async () => {
+  for (const opts of [
+    { userId: otherUserId },
+    { userId: "" },
+    { group: "Gunauthorized" },
+    { env: { LINE_ADMIN_USER_IDS: "" } },
+  ]) {
+    const result = await simulate("/分析", { ...opts,
+      fresh: "deny-" + JSON.stringify(opts), env: { GITHUB_ACTIONS_TOKEN: "github-test-token", ...(opts.env || {}) },
+    });
+    assert.equal(result.calls.filter((c) => c.type.startsWith("github-")).length, 0);
+    assert.equal(result.calls.filter((c) => c.type === "write").length, 0);
+    if (opts.group) assert.equal(result.replies.length, 0);
+    else assert.match(result.text, /⛔/);
+  }
+});
+
+test("/分析 no token or Github 404 fails closed with actionable message", async () => {
+  const noToken = await simulate("/分析", { fresh: "analysis-no-token" });
+  assert.match(noToken.text, /GITHUB_ACTIONS_TOKEN/);
+  assert.equal(noToken.calls.filter((c) => c.type.startsWith("github-")).length, 0);
+  const noWorkflow = await simulate("/分析", { fresh: "analysis-404",
+    env: { GITHUB_ACTIONS_TOKEN: "github-test-token" }, githubGetStatus: 404 });
+  assert.match(noWorkflow.text, /HTTP 404/);
+  assert.equal(noWorkflow.calls.filter((c) => c.type === "github-dispatch").length, 0);
+});
+
+test("/分析 checks queued and in-progress runs before dispatch", async () => {
+  for (const status of ["queued", "in_progress"]) {
+    const result = await simulate("/分析", { fresh: "analysis-" + status,
+      env: { GITHUB_ACTIONS_TOKEN: "github-test-token" },
+      workflowRuns: [githubRun(status === "queued" ? 101 : 102, status, null)],
+    });
+    assert.match(result.text, /不重複提交/);
+    assert.equal(result.calls.filter((c) => c.type === "github-dispatch").length, 0);
+  }
+});
+
+test("/分析 POST 403 or 422 never claims analysis started", async () => {
+  for (const status of [401, 403, 422]) {
+    const result = await simulate("/分析", { fresh: "post-failure-" + status,
+      env: { GITHUB_ACTIONS_TOKEN: "github-test-token" }, githubPostStatus: status });
+    assert.match(result.text, new RegExp("HTTP " + status));
+    assert.doesNotMatch(result.text, /已接受選股分析啟動要求/);
+    assert.equal(result.calls.filter((c) => c.type === "github-dispatch").length, 1);
+  }
+});
+
+test("/分析狀態 shows latest matching manual run and accurate completion", async () => {
+  const result = await simulate("/分析狀態", { fresh: "analysis-status-success",
+    env: { GITHUB_ACTIONS_TOKEN: "github-test-token" },
+    workflowRuns: [
+      githubRun(1, "completed", "failure", { created_at: "2026-11-06T00:00:00Z" }),
+      githubRun(2, "completed", "success", { created_at: "2026-11-08T00:01:00Z" }),
+      githubRun(3, "queued", null, { head_branch: "main", created_at: "2026-11-09T00:00:00Z" }),
+    ],
+  });
+  assert.match(result.text, /執行成功/);
+  assert.match(result.text, /\/actions\/runs\/2/);
+  assert.doesNotMatch(result.text, /\/actions\/runs\/3/);
+  assert.equal(result.calls.filter((c) => c.type === "github-dispatch").length, 0);
+});
+
+test("/分析狀態 remains a read-only GitHub operation and is restricted to admins", async () => {
+  const result = await simulate("/分析狀態", { fresh: "analysis-status-unauth",
+    env: { GITHUB_ACTIONS_TOKEN: "github-test-token" }, userId: otherUserId });
+  assert.match(result.text, /只有已授權的管理員/);
+  assert.equal(result.calls.filter((c) => c.type.startsWith("github-")).length, 0);
+  const pending = await simulate("/分析狀態", { fresh: "analysis-status-queued",
+    env: { GITHUB_ACTIONS_TOKEN: "github-test-token" },
+    workflowRuns: [githubRun(9876, "queued", null)] });
+  assert.match(pending.text, /排隊中/);
+  assert.match(pending.text, /\/actions\/runs\/9876/);
+});
+
+test("/分析 GitHub slow request never blocks webhook HTTP 200", async () => {
+  const result = await simulate("/分析", { fresh: "analysis-slow",
+    env: { GITHUB_ACTIONS_TOKEN: "github-test-token" }, githubDelayMs: 350 });
+  assert.ok(result.ackElapsedMs < 250, "Webhook took " + result.ackElapsedMs + "ms");
+  assert.equal(result.registeredAtAck, 1);
+  assert.equal(result.repliesAtAck, 0);
+  assert.match(result.text, /已接受選股分析啟動要求/);
 });
