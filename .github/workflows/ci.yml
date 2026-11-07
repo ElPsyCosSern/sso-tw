@@ -42,4 +42,4 @@ jobs:
       - run: npm run build
       - name: Cloudflare Worker unit tests
         working-directory: .
-        run: node --test cloudflare-worker/index.test.mjs cloudflare-worker/commands.test.mjs
+        run: node --test cloudflare-worker/index.test.mjs cloudflare-worker/commands.test.mjs cloudflare-worker/watchlist.test.mjs

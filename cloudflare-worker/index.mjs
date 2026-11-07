@@ -2,15 +2,18 @@
  * stock-line-bot — Step 5-7 original research report integration
  *
  * Existing /測試, /群組ID, /資料測試, /選股, /個股, /績效, /觀察
+ * Admin-only /新增, /移除; setup command /我的ID (allowed group only)
  * New /總覽, /建議, /量價, /夜盤, /盤前, /完整報告, /報告 N, /功能
  * All commands are confined to a signed, whitelisted LINE private group.
  *
- * No public Sheet endpoints. No writes to Sheets. No added npm dependency.
+ * No public Sheet endpoints. Only authorized editors may update Watchlist.
+ * All other Google Sheets operations remain read-only; no npm dependency.
  * Before production deployment, compare this file with the deployed source.
  */
 
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly";
+const SHEETS_WRITE_SCOPE = "https://www.googleapis.com/auth/spreadsheets";
 
 const DIAGNOSTIC_RANGES = [
   "'Watchlist'!A1:E101",
@@ -28,8 +31,8 @@ const QUERY_RANGES = {
 };
 const MAX_STOCKS_IN_REPLY = 25;
 
-let cachedToken = null;
-let cachedTokenExpiry = 0;
+// Cache read and write tokens separately; regular lookups must remain read-only.
+const tokenCache = new Map();
 
 function bytesToBase64Url(bytes) {
   let binary = "";
@@ -50,9 +53,13 @@ function pemToBytes(pem) {
   return Uint8Array.from(atob(raw), (ch) => ch.charCodeAt(0));
 }
 
-async function getGoogleAccessToken(env) {
+async function getGoogleAccessToken(env, scope = SHEETS_SCOPE) {
+  if (scope !== SHEETS_SCOPE && scope !== SHEETS_WRITE_SCOPE) {
+    throw new Error("Unsupported OAuth scope");
+  }
   const nowMs = Date.now();
-  if (cachedToken && cachedTokenExpiry > nowMs + 60_000) return cachedToken;
+  const cached = tokenCache.get(scope);
+  if (cached && cached.expiresAt > nowMs + 60_000) return cached.value;
 
   if (!env.GOOGLE_CREDS_JSON) throw new Error("Missing Google credential");
   let creds;
@@ -81,7 +88,7 @@ async function getGoogleAccessToken(env) {
   const header = { alg: "RS256", typ: "JWT" };
   const payload = {
     iss: creds.client_email,
-    scope: SHEETS_SCOPE,
+    scope,
     aud: GOOGLE_TOKEN_URL,
     iat: now - 30,
     exp: now + 3300,
@@ -108,9 +115,11 @@ async function getGoogleAccessToken(env) {
   if (typeof tokenData.access_token !== "string") {
     throw new Error("Invalid Google OAuth response");
   }
-  cachedToken = tokenData.access_token;
-  cachedTokenExpiry = nowMs + Math.max(0, Number(tokenData.expires_in || 3600)) * 1000;
-  return cachedToken;
+  tokenCache.set(scope, {
+    value: tokenData.access_token,
+    expiresAt: nowMs + Math.max(0, Number(tokenData.expires_in || 3600)) * 1000,
+  });
+  return tokenData.access_token;
 }
 
 async function readSheets(env, ranges = DIAGNOSTIC_RANGES) {
@@ -456,6 +465,156 @@ async function watchlistMessage(env) {
   }
   lines.push("以上為 Google Sheets 名單，並非買進建議。");
   return lines.join("\n");
+}
+
+
+const WATCHLIST_WRITE_RANGE = "'Watchlist'";
+const STOCK_ID_PATTERN = /^[0-9]{4,6}$/;
+
+function colName(index) {
+  if (!Number.isSafeInteger(index) || index < 0) throw new Error("Invalid column");
+  let value = index + 1;
+  let result = "";
+  while (value > 0) {
+    value--;
+    result = String.fromCharCode(65 + (value % 26)) + result;
+    value = Math.floor(value / 26);
+  }
+  return result;
+}
+
+function parseWatchlist(values, stockId) {
+  if (!values.length || !Array.isArray(values[0])) {
+    throw new Error("Watchlist header missing");
+  }
+  const headers = values[0].map((v) => String(v).trim());
+  const required = ["stock_id", "enabled"];
+  if (required.some((column) => headers.indexOf(column) < 0) ||
+      new Set(headers.filter(Boolean)).size !== headers.filter(Boolean).length) {
+    throw new Error("Watchlist schema mismatch");
+  }
+  const stockCol = headers.indexOf("stock_id");
+  const enabledCol = headers.indexOf("enabled");
+  const matches = [];
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i]?.[stockCol] ?? "").trim() === stockId) {
+      matches.push({
+        sheetRow: i + 1,
+        enabled: ["TRUE", "1", "YES"].includes(
+          String(values[i]?.[enabledCol] ?? "").trim().toUpperCase()
+        ),
+      });
+    }
+  }
+  if (matches.length > 1) throw new Error("Duplicate stock IDs in Watchlist");
+  return { headers, enabledCol, match: matches[0] || null };
+}
+
+function isWatchlistAdmin(env, userId) {
+  // Unlike the group whitelist, the editor allowlist must be explicitly set.
+  if (!userId || !env.LINE_ADMIN_USER_IDS) return false;
+  const allowed = String(env.LINE_ADMIN_USER_IDS)
+    .split(/[,\s;]+/)
+    .map((id) => id.trim())
+    .filter(Boolean);
+  return allowed.includes(userId);
+}
+
+async function writeWatchlistValue(env, operation, a1Range, rowValues) {
+  if (!env.GOOGLE_SHEET_ID || !env.GOOGLE_CREDS_JSON) {
+    throw new Error("Google Sheets bindings missing");
+  }
+  const spreadsheetId = String(env.GOOGLE_SHEET_ID).trim();
+  if (!/^[A-Za-z0-9_-]+$/.test(spreadsheetId)) throw new Error("Invalid spreadsheet ID");
+  // Only two permitted operations: update a single existing enabled cell,
+  // or append exactly one new Watchlist row; never clear/replace the worksheet.
+  if (operation !== "update" && operation !== "append") {
+    throw new Error("Invalid Watchlist operation");
+  }
+  const token = await getGoogleAccessToken(env, SHEETS_WRITE_SCOPE);
+  const url = new URL(
+    "https://sheets.googleapis.com/v4/spreadsheets/" + spreadsheetId +
+    "/values/" + encodeURIComponent(a1Range) + (operation === "append" ? ":append" : "")
+  );
+  url.searchParams.set("valueInputOption", "RAW");
+  if (operation === "append") url.searchParams.set("insertDataOption", "INSERT_ROWS");
+
+  const response = await fetch(url.toString(), {
+    method: operation === "append" ? "POST" : "PUT",
+    headers: {
+      Authorization: "Bearer " + token,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      range: a1Range,
+      majorDimension: "ROWS",
+      values: [rowValues],
+    }),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!response.ok) throw new Error("Google Sheets write failed");
+  const result = await response.json();
+  const changed = operation === "append"
+    ? Number(result.updates?.updatedRows)
+    : Number(result.updatedCells);
+  if (changed !== 1) {
+    throw new Error("Unexpected Google Sheets update result");
+  }
+}
+
+async function changeWatchlist(env, action, stockId, name = "", category = "") {
+  if (action !== "add" && action !== "remove") throw new Error("Invalid action");
+  if (!STOCK_ID_PATTERN.test(stockId)) throw new Error("Invalid stock ID");
+
+  const [before] = await readSheets(env, [WATCHLIST_WRITE_RANGE]);
+  const sheet = parseWatchlist(before, stockId);
+  const current = sheet.match;
+
+  if (action === "add") {
+    if (current?.enabled) {
+      return "ℹ️ " + stockId + " 已在觀察清單內，無須重複新增。";
+    }
+    if (current) {
+      await writeWatchlistValue(
+        env, "update",
+        "'Watchlist'!" + colName(sheet.enabledCol) + current.sheetRow,
+        ["TRUE"]
+      );
+    } else {
+      const row = sheet.headers.map((header) => {
+        if (header === "stock_id") return stockId;
+        if (header === "name") return name;
+        if (header === "category") return category || "未分類";
+        if (header === "enabled") return "TRUE";
+        return "";
+      });
+      await writeWatchlistValue(env, "append", WATCHLIST_WRITE_RANGE, row);
+    }
+  } else {
+    if (!current) return "ℹ️ " + stockId + " 不在觀察清單，沒有需要停用的資料。";
+    if (!current.enabled) return "ℹ️ " + stockId + " 已停用，無須重複操作。";
+    await writeWatchlistValue(
+      env, "update",
+      "'Watchlist'!" + colName(sheet.enabledCol) + current.sheetRow,
+      ["FALSE"]
+    );
+  }
+
+  // Read back from Google before claiming the command took effect.
+  const [after] = await readSheets(env, [WATCHLIST_WRITE_RANGE]);
+  const verified = parseWatchlist(after, stockId).match;
+  if (!verified || verified.enabled !== (action === "add")) {
+    throw new Error("Watchlist read-back verification failed");
+  }
+  if (action === "remove") {
+    return "✅ " + stockId + " 已停用（enabled=FALSE），原有分析紀錄保留。輸入 /觀察 確認。";
+  }
+  const missingName = !current && !name;
+  return "✅ " + stockId +
+    (current ? " 已重新啟用" : " 已新增到觀察清單") +
+    "（enabled=TRUE）。" +
+    (missingName ? "\n⚠️ 名稱未填、類股暫列「未分類」。請至 Watchlist 補充，或首次新增時使用 /新增 2882 國泰金 金融。" : "") +
+    "\n新的選股結果須等下次執行分析後才會產生。";
 }
 
 async function performanceMessage(env) {
@@ -814,6 +973,35 @@ export default {
       } else if (allowedGroupId && groupId === allowedGroupId) {
         if (command === "/測試") {
           message = "✅ LINE 機器人連線成功！";
+        } else if (command === "/我的ID") {
+          message = event.source.userId
+            ? "🔐 你的 LINE User ID：" + event.source.userId +
+              "\n請勿轉傳此個人識別碼；將它設定為 Cloudflare Secret：LINE_ADMIN_USER_IDS。"
+            : "⚠️ LINE 沒有提供你的 User ID，無法建立編輯權限。請改用 LINE 手機版發送此指令。";
+        } else if (command.startsWith("/新增") || command.startsWith("/移除")) {
+          const isAdd = command.startsWith("/新增");
+          const match = isAdd
+            ? command.match(/^\/新增\s+([0-9]{4,6})(?:\s+([^\s]{1,30}))?(?:\s+([^\s]{1,30}))?$/u)
+            : command.match(/^\/移除\s+([0-9]{4,6})$/u);
+          if (!match) {
+            message = isAdd
+              ? "用法：/新增 2882 或 /新增 2882 國泰金 金融（僅支援 4～6 位數字代號）"
+              : "用法：/移除 2882（僅支援 4～6 位數字代號）";
+          } else if (!String(env.LINE_ADMIN_USER_IDS || "").trim()) {
+            message = "⛔ 尚未設定 LINE_ADMIN_USER_IDS，觀察清單寫入功能維持停用。";
+          } else if (!event.source.userId) {
+            message = "⛔ LINE 未提供 User ID，無法確認管理員身分；請使用 LINE 手機版重試。";
+          } else if (!isWatchlistAdmin(env, event.source.userId)) {
+            message = "⛔ 只有已設定的管理員可以修改觀察清單。";
+          } else {
+            try {
+              message = await changeWatchlist(
+                env, isAdd ? "add" : "remove", match[1], match[2] || "", match[3] || ""
+              );
+            } catch {
+              message = "⚠️ Watchlist 更新或回讀驗證失敗，請先用 /觀察 確認資料，再決定是否重試。";
+            }
+          }
         } else if (
           command === "/資料測試" ||
           command === "/選股" ||
@@ -867,6 +1055,9 @@ export default {
                 "/完整報告－四大研究報告\n" +
                 "/報告 2－完整報告續頁\n" +
                 "/觀察、/績效、/資料測試－既有查詢\n" +
+                "/新增 2882－新增／重新啟用（管理員）\n" +
+                "/移除 2882－停用但保留歷史（管理員）\n" +
+                "/我的ID－取得管理員設定用 User ID\n" +
                 "僅供研究參考，所有行情日期請以回覆標示為準。";
             } else {
               const match = command.match(/^\/個股\s+([0-9]{4,6})$/);
