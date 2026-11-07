@@ -1,14 +1,9 @@
 /**
- * stock-line-bot — Step 5-4
+ * stock-line-bot — Step 5-7 original research report integration
  *
- * LINE private-group commands:
- *   /測試      Existing connectivity reply
- *   /群組ID    Existing one-time setup command (disabled after whitelist is set)
- *   /資料測試  Read-only Google Sheets diagnostic
- *   /選股      Latest committed screening batch, with freshness gate
- *   /個股 2330 Most recent committed screening for one stock
- *   /績效      Historical T+20 tracking summary
- *   /觀察      Enabled Watchlist stocks
+ * Existing /測試, /群組ID, /資料測試, /選股, /個股, /績效, /觀察
+ * New /總覽, /建議, /量價, /夜盤, /盤前, /完整報告, /報告 N, /功能
+ * All commands are confined to a signed, whitelisted LINE private group.
  *
  * No public Sheet endpoints. No writes to Sheets. No added npm dependency.
  * Before production deployment, compare this file with the deployed source.
@@ -300,7 +295,11 @@ function committedDailyBatches(signalValues, reportValues) {
     if (Number(marker.error_count) !== errors) {
       throw new Error("Signal error count mismatch");
     }
-    return { marker, signals: currentSignals };
+    return {
+      marker,
+      signals: currentSignals,
+      parts: parts.sort((a, b) => Number(a.part) - Number(b.part)),
+    };
   });
 }
 
@@ -424,6 +423,20 @@ async function individualStockMessage(env, stockId) {
   } else if (s.risk_notes) {
     lines.push("風險註記：" + safeCell(s.risk_notes, 240));
   }
+  if (s.action !== "ERROR") {
+    try {
+      const originalDetails = extractOriginalStockDetail(batch, stockId);
+      if (originalDetails.length) {
+        lines.push("📑 原作者本批分析理由（" +
+          (batchIsCurrent(batch) ? "今日資料" : "歷史紀錄") + "）：");
+        lines.push(...originalDetails);
+      } else {
+        lines.push("本次完整報告沒有可擷取的個股理由；可輸入 /完整報告 閱讀原文。");
+      }
+    } catch {
+      lines.push("原始個股詳情格式無法解析；請使用 /選股 查看基本訊號。");
+    }
+  }
   return lines.join("\n");
 }
 
@@ -489,6 +502,229 @@ async function performanceMessage(env) {
   return lines.join("\n");
 }
 
+
+/**
+ * Render the original reports rather than rebuilding market analysis in Worker.
+ * save_report() stores each original format_messages() section in Reports.content
+ * (possibly split into 20k-character parts); part=0 is the commit marker.
+ */
+const DAILY_SECTIONS = [
+  { key: "overview", title: "市場總覽", start: /^📊\s*\*?V3\.\d+\s*每日選股報告[^\n]*/m },
+  { key: "details", title: "個股完整分析", start: /^🟢\s*\*?BUY(?:\s|:|—)[^\n]*/m },
+  { key: "advice", title: "操作建議", start: /^🧠\s*\*?今日操作建議[^\n]*/m },
+  { key: "volume", title: "量價深度解析", start: /^🔬\s*\*?量價深度解析[^\n]*/m },
+];
+
+function originalReportSections(batch) {
+  if (!batch.parts || !batch.parts.length) throw new Error("Report body missing");
+  const full = batch.parts.map((part) => part.content).join("\n");
+  const starts = DAILY_SECTIONS.map((s) => full.search(s.start));
+  if (starts.some((at) => at < 0) ||
+      starts.some((at, i) => i > 0 && at <= starts[i - 1])) {
+    throw new Error("Unknown daily report format");
+  }
+  return Object.fromEntries(
+    DAILY_SECTIONS.map((s, i) => [
+      s.key,
+      full.slice(starts[i], starts[i + 1] ?? full.length).trim(),
+    ])
+  );
+}
+
+function sanitizeReportText(text, isHistorical) {
+  let content = String(text)
+    // Telegram markdown asterisks are not formatting in LINE plain text.
+    .replace(/\*/g, "")
+    // No raw access tokens or credentialed upstream URLs in chat.
+    .replace(/https?:\/\/[^\s]*(?:token|api[_-]?key|secret|authorization)[^\s]*/gi, "[敏感網址已隱藏]")
+    .replace(/\b(token|access_token|api[_-]?key|secret)\s*[=:]\s*[^\s]+/gi, "$1=[隱藏]")
+    .replace(/市場氛圍/g, "觀察池市場氛圍")
+    .replace(/類股強弱排名/g, "觀察池類股強弱排名");
+  if (isHistorical) {
+    content = content
+      .replace(/今日操作建議/g, "當時操作建議（歷史）")
+      .replace(/明日開盤進場/g, "當時的隔日開盤進場假設（已過期）")
+      .replace(/(?:今日)?開盤方向預判/g, "當時開盤方向判斷（歷史）");
+  }
+  return content;
+}
+
+function splitLongText(text, limit = 3500) {
+  const pieces = [];
+  let remaining = String(text);
+  while (remaining.length > limit) {
+    let cut = remaining.lastIndexOf("\n", limit);
+    if (cut < limit / 2) cut = limit;
+    // LINE counts UTF-16 code units; don't cut a surrogate pair in half.
+    if (cut > 0 && /[\uD800-\uDBFF]/.test(remaining[cut - 1])) cut--;
+    if (cut <= 0) throw new Error("Unable to split report");
+    pieces.push(remaining.slice(0, cut));
+    remaining = remaining.slice(cut);
+    if (remaining.startsWith("\n")) {
+      pieces[pieces.length - 1] += "\n";
+      remaining = remaining.slice(1);
+    }
+  }
+  if (remaining) pieces.push(remaining);
+  return pieces.length ? pieces : [""];
+}
+
+function dailyReportPages(batch) {
+  const sections = originalReportSections(batch);
+  const historical = !batchIsCurrent(batch);
+  const date = safeCell(batch.marker.data_date || "未知", 18);
+  const status = safeCell(batch.marker.status, 20);
+  const warning = historical
+    ? "⚠️ 歷史／未完整驗證，不可當作今日買進或開盤建議。"
+    : "✅ 當日資料，並非即時報價或保證獲利的交易指示。";
+  const allPages = [];
+  for (const section of DAILY_SECTIONS) {
+    const original = sections[section.key];
+    const content = sanitizeReportText(original, historical);
+    const chunks = splitLongText(content, 3500);
+    chunks.forEach((part, i) => {
+      const title = "📑 " + section.title + (chunks.length > 1 ? "（" + (i + 1) + "/" + chunks.length + "）" : "");
+      const caveat = section.key === "overview"
+        ? "\n📌 市場氛圍與類股強弱僅統計 Watchlist 觀察池，非全台股。"
+        : "";
+      allPages.push([
+        title,
+        "行情日：" + date + "｜狀態：" + status,
+        warning + caveat,
+        "",
+        part,
+      ].join("\n"));
+    });
+  }
+  return allPages;
+}
+
+function pageGroup(pages, page = 1) {
+  const maxGroup = Math.ceil(pages.length / 4);
+  if (!Number.isSafeInteger(page) || page < 1 || page > maxGroup) {
+    return "沒有第 " + page + " 組；本報告共有 " + maxGroup + " 組。請輸入 /完整報告。";
+  }
+  const from = (page - 1) * 4;
+  const visible = pages.slice(from, from + 4);
+  if (page < maxGroup) {
+    const tail = "\n\n📖 下一組：/報告 " + (page + 1) +
+      "（每次以最新提交的批次重新讀取）";
+    visible[visible.length - 1] += tail;
+  }
+  // LINE reply API max 5 messages, each max 5000 UTF-16 code units.
+  if (visible.length > 5 || visible.some((s) => s.length > 4900)) {
+    throw new Error("LINE report length limit exceeded");
+  }
+  return visible;
+}
+
+async function fullReportMessage(env, group = 1) {
+  const batch = await latestBatchForQuery(env);
+  if (!batch) return "📭 尚無可供查看的已提交每日報告。";
+  return pageGroup(dailyReportPages(batch), group);
+}
+
+async function reportSectionMessage(env, sectionName) {
+  const batch = await latestBatchForQuery(env);
+  if (!batch) return "📭 尚無可供查看的已提交每日報告。";
+  const sections = originalReportSections(batch);
+  const content = sanitizeReportText(sections[sectionName], !batchIsCurrent(batch));
+  const lines = [
+    "📑 " + DAILY_SECTIONS.find((s) => s.key === sectionName).title,
+    ...batchHeader(batch),
+  ];
+  if (sectionName === "overview") {
+    lines.push("📌 以下市場氛圍及類股排名只統計 Watchlist，非全台股。");
+  }
+  const head = lines.join("\n") + "\n\n";
+  const chunks = splitLongText(content, 3500).map((s) => head + s);
+  if (chunks.length > 4) {
+    return ["報告較長，請使用 /完整報告 並依提示輸入 /報告 2、/報告 3 閱讀完整內容。"];
+  }
+  return chunks;
+}
+
+function extractOriginalStockDetail(batch, stockId) {
+  const sections = originalReportSections(batch);
+  const lines = sections.details.split("\n");
+  const stockLine = new RegExp("^\\*?" + stockId + "\\s+");
+  const start = lines.findIndex((line) => stockLine.test(line));
+  if (start < 0) return [];
+  let end = start + 1;
+  while (end < lines.length &&
+      !/^\*?[0-9]{4,6}\s/.test(lines[end]) &&
+      !/^[🟢🟡]\s*\*?(?:BUY|WATCH)/.test(lines[end])) {
+    end++;
+  }
+  return lines.slice(start + 1, end)
+    .filter((line) => /^(?:🔥|📈|📉|💥|基本面|💡\s*為何買|❓\s*差在)/.test(line.trim()))
+    .map((line) => safeCell(sanitizeReportText(line, !batchIsCurrent(batch)), 260))
+    .filter(Boolean);
+}
+
+async function nightFilterMessage(env) {
+  const batch = await latestBatchForQuery(env);
+  if (!batch) return "📭 尚無夜盤濾鏡歷史報告。";
+  const sections = originalReportSections(batch);
+  const match = sections.overview.match(/^🌙\s*\*?夜盤濾鏡\*?\s*\n([^\n]+)/m);
+  const lines = ["🌙 收盤後夜盤情緒濾鏡（非盤前即時行情）", ...batchHeader(batch)];
+  lines.push(match
+    ? sanitizeReportText(match[1], !batchIsCurrent(batch))
+    : "這份日報沒有可擷取的夜盤濾鏡註記。");
+  lines.push("如需早上 08:00 夜盤快報，請輸入 /盤前。");
+  return lines.join("\n");
+}
+
+function committedPremarketReport(reportValues) {
+  const reports = recordsFromSheet(reportValues, [
+    "run_id", "kind", "part", "content", "status", "data_date", "generated_at_utc",
+  ]);
+  const markers = reports
+    .filter((row) => row.kind === "premarket" && row.part.trim() === "0")
+    .sort((a, b) => b.generated_at_utc.localeCompare(a.generated_at_utc));
+  if (!markers.length) return null;
+  const marker = markers[0];
+  if (!marker.run_id ||
+      !["complete", "partial", "stale", "unavailable"].includes(marker.status)) {
+    throw new Error("Invalid premarket marker");
+  }
+  const total = Number(marker.content);
+  const parts = reports
+    .filter((r) => r.kind === "premarket" && r.run_id === marker.run_id && r.part !== "0")
+    .sort((a, b) => Number(a.part) - Number(b.part));
+  if (!Number.isSafeInteger(total) || total < 1 || total > 100 ||
+      parts.length !== total ||
+      parts.some((r, i) =>
+        Number(r.part) !== i + 1 || !r.content || r.status !== marker.status)) {
+    throw new Error("Incomplete premarket report");
+  }
+  return { marker, parts };
+}
+
+async function premarketMessage(env) {
+  const [reportValues] = await readSheets(env, [QUERY_RANGES.reports]);
+  const report = committedPremarketReport(reportValues);
+  if (!report) {
+    return "📭 尚無已提交的 08:00 夜盤盤前快報；正式盤前排程目前尚未啟用。";
+  }
+  const isCurrent = report.marker.status === "complete" &&
+    report.marker.data_date === taiwanDate();
+  const header = [
+    "🌙 最近盤前夜盤快報",
+    "夜盤資料標籤日：" + safeCell(report.marker.data_date || "未知", 18) +
+      "｜狀態：" + safeCell(report.marker.status, 20),
+    isCurrent
+      ? "✅ 盤前資料已通過時效驗證，仍非即時行情或必然開盤方向。"
+      : "⚠️ 歷史／不完整盤前報告，不可當作今日開盤方向預判。",
+    "",
+  ].join("\n");
+  const body = sanitizeReportText(report.parts.map((p) => p.content).join("\n"), !isCurrent);
+  const chunks = splitLongText(body, 3500).map((part) => header + part);
+  return chunks.length <= 4
+    ? chunks
+    : "這份夜盤快報太長，為避免內容截斷而停止顯示。";
+}
+
 async function checkLineSignature(rawBody, signature, secret) {
   if (!signature || !secret) return false;
   let supplied;
@@ -513,6 +749,11 @@ async function checkLineSignature(rawBody, signature, secret) {
 }
 
 async function replyToLine(env, replyToken, message) {
+  const texts = Array.isArray(message) ? message : [message];
+  if (!texts.length || texts.length > 5 ||
+      texts.some((text) => typeof text !== "string" || !text || text.length > 4900)) {
+    throw new Error("LINE response length/count invalid");
+  }
   const response = await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
     headers: {
@@ -521,7 +762,7 @@ async function replyToLine(env, replyToken, message) {
     },
     body: JSON.stringify({
       replyToken,
-      messages: [{ type: "text", text: message.slice(0, 4000) }],
+      messages: texts.map((text) => ({ type: "text", text })),
     }),
     signal: AbortSignal.timeout(8000),
   });
@@ -578,6 +819,14 @@ export default {
           command === "/選股" ||
           command === "/觀察" ||
           command === "/績效" ||
+          command === "/完整報告" ||
+          command === "/總覽" ||
+          command === "/建議" ||
+          command === "/量價" ||
+          command === "/夜盤" ||
+          command === "/盤前" ||
+          command === "/功能" ||
+          command.startsWith("/報告") ||
           command.startsWith("/個股")
         ) {
           try {
@@ -589,6 +838,36 @@ export default {
               message = await watchlistMessage(env);
             } else if (command === "/績效") {
               message = await performanceMessage(env);
+            } else if (command === "/完整報告") {
+              message = await fullReportMessage(env);
+            } else if (command.startsWith("/報告")) {
+              const match = command.match(/^\/報告\s+([1-9][0-9]{0,2})$/);
+              message = match
+                ? await fullReportMessage(env, Number(match[1]))
+                : "用法：/報告 2（查看完整報告的下一組內容）";
+            } else if (command === "/總覽") {
+              message = await reportSectionMessage(env, "overview");
+            } else if (command === "/建議") {
+              message = await reportSectionMessage(env, "advice");
+            } else if (command === "/量價") {
+              message = await reportSectionMessage(env, "volume");
+            } else if (command === "/夜盤") {
+              message = await nightFilterMessage(env);
+            } else if (command === "/盤前") {
+              message = await premarketMessage(env);
+            } else if (command === "/功能") {
+              message = "📚 LINE 台股研究查詢\n" +
+                "/總覽－市場氛圍與類股強弱\n" +
+                "/選股－BUY/WATCH/SKIP 摘要\n" +
+                "/個股 2330－個股分析與理由\n" +
+                "/建議－原作者操作建議\n" +
+                "/量價－量價深度解析\n" +
+                "/夜盤－最新日報夜盤濾鏡\n" +
+                "/盤前－08:00 夜盤盤前快報\n" +
+                "/完整報告－四大研究報告\n" +
+                "/報告 2－完整報告續頁\n" +
+                "/觀察、/績效、/資料測試－既有查詢\n" +
+                "僅供研究參考，所有行情日期請以回覆標示為準。";
             } else {
               const match = command.match(/^\/個股\s+([0-9]{4,6})$/);
               message = match

@@ -252,3 +252,34 @@ def test_premarket_persists_warning_only_when_stale(monkeypatch):
     assert saved["kind"] == "premarket"
     assert "本次不提供開盤方向" in saved["messages"][0]
     assert "明日開盤進場" not in saved["messages"][0]
+
+
+
+def test_original_four_report_headings_remain_compatible_with_line_worker():
+    """Contract: Reports.content source sections used by the LINE Worker.
+
+    If the upstream report title or section count changes, review the Worker
+    section mapping before deploying, instead of silently dropping content.
+    """
+    from stock_strategies.notify import format_messages
+
+    signals = [{
+        "stock_id": "0050",
+        "name": "元大台灣50",
+        "action": "SKIP",
+        "signal_score": 40,
+        "trend": {},
+        "components": {},
+    }]
+    watchlist = [{"stock_id": "0050", "category": "ETF"}]
+    messages = format_messages(
+        signals,
+        watchlist,
+        market={"note": "大盤資料示意"},
+        night_note="夜盤資料示意",
+    )
+    assert len(messages) == 4
+    assert messages[0].startswith("📊 *V3.0 每日選股報告*")
+    assert messages[1].startswith("🟢 *BUY")
+    assert messages[2].startswith("🧠 *今日操作建議*")
+    assert messages[3].startswith("🔬 *量價深度解析*")
