@@ -149,7 +149,7 @@ def test_report_content_precedes_commit_marker(fake_sheet):
 def test_daily_status_requires_current_prices_and_complete_sources():
     base = [{"stock_id": "2330", "action": "WATCH", "price_date": "2026-11-06"}]
     watch = [{"stock_id": "2330"}]
-    market = {"close": 30000}
+    market = {"close": 30000, "data_date": "2026-11-06"}
     night = {"date": "2026-11-06"}
     assert reporting.daily_status(base, watch, market, night, "2026-11-06") == "complete"
     assert reporting.daily_status(base, watch, market, night, "2026-11-07") == "stale"

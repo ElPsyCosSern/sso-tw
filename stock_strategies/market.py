@@ -20,12 +20,14 @@ def get_market_state(ma_period: int = 20) -> dict:
         latest = df.iloc[-1]
         close = float(latest["close"]); ma20 = float(latest["ma20"])
         bullish = close > ma20
+        data_date = str(latest["date"])[:10]
         pct = (close / ma20 - 1) * 100
         if bullish:
             note = f"🟢 加權 {close:.0f} 站上 {ma_period} 日線 ({pct:+.1f}%)，BUY 訊號照常發出"
         else:
             note = f"🔴 加權 {close:.0f} 跌破 {ma_period} 日線 ({pct:+.1f}%)，BUY 全數降為 WATCH"
-        return {"bullish": bullish, "close": close, "ma20": ma20, "note": note}
+        return {"bullish": bullish, "close": close, "ma20": ma20,
+                "data_date": data_date, "note": note}
     except Exception as e:
         return {"bullish": True, "close": None, "ma20": None,
                 "note": f"⚠️ 大盤狀態取得失敗（{str(e)[:60]}），暫不套用濾鏡"}

@@ -19,7 +19,7 @@ def daily_status(signals: list[dict], watchlist: list[dict], market: dict, night
     if not market or market.get("close") is None or not night:
         return "partial"
     dates = {str(s.get("price_date") or "") for s in signals}
-    if dates != {today}:
+    if dates != {today} or market.get("data_date") != today:
         return "stale"
     return "complete"
 
