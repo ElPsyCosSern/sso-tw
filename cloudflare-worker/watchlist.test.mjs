@@ -186,6 +186,9 @@ async function simulate(command, opts = {}) {
       const ranges = u.searchParams.getAll("ranges");
       calls.push({ type: "read", ranges });
       sheetsReadCount++;
+      if (sheetsReadCount === 1 && opts.delayInitialReadMs) {
+        await new Promise((resolve) => setTimeout(resolve, opts.delayInitialReadMs));
+      }
       if (sheetsReadCount === 2 && opts.delayVerificationMs) {
         await new Promise((resolve) => setTimeout(resolve, opts.delayVerificationMs));
       }
@@ -238,14 +241,24 @@ async function simulate(command, opts = {}) {
     const handler = opts.fresh
       ? (await import("./index.mjs?test=" + encodeURIComponent(opts.fresh))).default
       : worker;
+    const startedAt = performance.now();
     const response = await handler.fetch(signedRequest(
       command, opts.userId === undefined ? adminId : opts.userId, opts.group ?? groupId
     ), config, {
       waitUntil: (promise) => { pending.push(promise); },
     });
+    const ackElapsedMs = performance.now() - startedAt;
+    const callsAtAck = calls.length;
+    const repliesAtAck = replies.length;
+    const registeredAtAck = pending.length;
     assert.equal(response.status, 200);
-    if (pending.length) await Promise.all(pending);
-    return { rows, calls, replies, timeline, text: replies.join("\n") };
+    // waitUntil callbacks can register additional background work AFTER the
+    // initial handler promise has been registered. Drain the dynamic queue.
+    for (let i = 0; i < pending.length; i++) await pending[i];
+    return {
+      rows, calls, replies, timeline, text: replies.join("\n"),
+      ackElapsedMs, callsAtAck, repliesAtAck, registeredAtAck,
+    };
   } finally {
     globalThis.fetch = previousFetch;
   }
@@ -420,7 +433,7 @@ test("/新增 writes no formulas, score or existing signal rows", async () => {
 
 test("/版本 identifies deployed Worker source without Google calls", async () => {
   const { text, calls } = await simulate("/版本");
-  assert.match(text, /5\.8\.4/);
+  assert.match(text, /5\.8\.5/);
   assert.equal(calls.length, 0);
 });
 
@@ -597,6 +610,9 @@ test("/新增 sends an early free LINE acknowledgement when Sheets verification 
   const result = await simulate("/新增 00685L", {
     delayVerificationMs: 5200,
   });
+  assert.ok(result.ackElapsedMs < 250, "Webhook ack took " + result.ackElapsedMs + "ms");
+  assert.equal(result.registeredAtAck, 1);
+  assert.equal(result.repliesAtAck, 0);
   assert.deepEqual(result.rows.at(-1), ["00685L", "群益臺灣加權正2", "ETF", "TRUE"]);
   assert.equal(result.replies.length, 1);
   assert.match(result.text, /已收到 \/新增 00685L/);
@@ -716,4 +732,56 @@ test("fallback uses latest FinMind market when a stock transferred from emerging
   assert.doesNotMatch(text, /興櫃採議價交易/);
   assert.match(text, /FinMind TaiwanStockInfo/);
   assert.equal(calls.filter((call) => call.type === "finmind").length, 1);
+});
+
+
+test("Webhook HTTP 200 is returned before slow stock-directory lookup and Sheets write", async () => {
+  const result = await simulate("/新增 3444", {
+    fresh: "async-3444-otc", delayCatalogMs: 350, blockTpex: true,
+  });
+  assert.ok(result.ackElapsedMs < 250, "Webhook ack took " + result.ackElapsedMs + "ms");
+  assert.equal(result.registeredAtAck, 1);
+  assert.equal(result.repliesAtAck, 0);
+  assert.deepEqual(result.rows.at(-1), ["3444", "利機", "電子通路", "TRUE"]);
+  assert.match(result.text, /3444 利機/);
+  assert.ok(result.calls.some((call) => call.type === "write"));
+  assert.deepEqual(result.timeline, ["write", "reply"]);
+});
+
+test("read-only /觀察 also returns Webhook HTTP 200 before delayed Google read", async () => {
+  const result = await simulate("/觀察", { delayInitialReadMs: 350 });
+  assert.ok(result.ackElapsedMs < 250, "Webhook ack took " + result.ackElapsedMs + "ms");
+  assert.equal(result.registeredAtAck, 1);
+  assert.equal(result.repliesAtAck, 0);
+  assert.match(result.text, /0050 元大台灣50/);
+  assert.equal(result.calls.filter((call) => call.type === "write").length, 0);
+});
+
+test("Webhook signature rejection is still synchronous 401 and schedules no work", async () => {
+  const pending = [];
+  const request = new Request("https://worker.test/webhook", {
+    method: "POST",
+    headers: { "x-line-signature": "invalid" },
+    body: JSON.stringify({ events: [] }),
+  });
+  const response = await worker.fetch(request, baseEnv, {
+    waitUntil: (p) => { pending.push(p); },
+  });
+  assert.equal(response.status, 401);
+  assert.equal(pending.length, 0);
+});
+
+test("malformed signed Webhook JSON is 400 without scheduling processing", async () => {
+  const badBody = "{not-json";
+  const signed = createHmac("sha256", lineSecret).update(badBody).digest("base64");
+  const pending = [];
+  const response = await worker.fetch(new Request("https://worker.test/webhook", {
+    method: "POST",
+    headers: { "x-line-signature": signed },
+    body: badBody,
+  }), baseEnv, {
+    waitUntil: (p) => { pending.push(p); },
+  });
+  assert.equal(response.status, 400);
+  assert.equal(pending.length, 0);
 });

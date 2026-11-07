@@ -1260,9 +1260,13 @@ export default {
       return new Response("Invalid JSON", { status: 400 });
     }
 
-    for (const event of payload.events || []) {
+    // LINE needs a fast HTTP acknowledgement even when Google Sheets or
+    // official stock directory calls are slow. Do not await command handling
+    // on the webhook HTTP response path.
+    const processEvents = async () => {
+      for (const event of Array.isArray(payload?.events) ? payload.events : []) {
       if (
-        event.type !== "message" ||
+        event?.type !== "message" ||
         event.message?.type !== "text" ||
         event.source?.type !== "group" ||
         !event.replyToken
@@ -1280,7 +1284,7 @@ export default {
         if (command === "/測試") {
           message = "✅ LINE 機器人連線成功！";
         } else if (command === "/版本") {
-          message = "🛠️ stock-line-bot／5.8.4（櫃買備援資料源）";
+          message = "🛠️ stock-line-bot／5.8.5（Webhook 快速回應修正）";
         } else if (command === "/我的ID") {
           message = event.source.userId
             ? "🔐 你的 LINE User ID：" + event.source.userId +
@@ -1410,6 +1414,18 @@ export default {
       if (backgroundWrite && typeof ctx?.waitUntil !== "function") {
         await backgroundWrite;
       }
+      }
+    };
+    if (typeof ctx?.waitUntil === "function") {
+      // Extends the invocation after the response. Keep the method bound to ctx.
+      ctx.waitUntil(processEvents().catch((error) => {
+        console.error("webhook_processing_error", {
+          name: error?.name || "Error",
+        });
+      }));
+    } else {
+      // Node test adapters can omit ExecutionContext. Cloudflare always supplies it.
+      await processEvents();
     }
 
     return new Response("OK", { status: 200 });

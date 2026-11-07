@@ -2,6 +2,8 @@
 
 本 Worker 連接 LINE 私人群組和 Google Sheets。原有研究報告查詢維持唯讀，只有指定 LINE 管理員可以新增／移除 Watchlist 股票。
 
+**目前功能分支版本：5.8.5（Webhook 499 快速 HTTP 200 修正）**。下方 5.8.3／5.8.4 為歷史變更紀錄，正式部署應使用最新固定 Commit。
+
 **狀態**：本版本程式與模擬測試已完成；正式 Cloudflare 仍須手動備份、部署和驗收。本版本不會自行修改線上 Worker、真實試算表或 GitHub 排程。
 
 ## LINE 指令
@@ -162,3 +164,33 @@ https://developers.cloudflare.com/workers/runtime-apis/context/
 - 官方櫃買資料：https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O
 - 興櫃資料：https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_R
 - FinMind 免費台股總覽：https://finmind.github.io/tutor/TaiwanMarket/Technical/
+
+
+## Step 5.8.5｜Webhook 499 快速 HTTP 200 修正
+
+2026-11-07 Cloudflare 流量畫面顯示 POST /webhook 同時有 200 與 499（Client Closed Request）。499 表示請求端在收到完整回應前先中斷連線，**不等同於 Worker 內部錯誤，也不能僅憑此圖判定是哪個 LINE 指令**。LINE 官方建議 Webhook 收到後約 2 秒內回 HTTP 200，避免上游逾時與重送。
+
+此前 Worker 要等 /新增 的股票查詢、Google Sheets 寫入與 LINE Reply 全部完成，才回 Webhook HTTP 200；即使新增了「5 秒後先回覆 LINE 處理中」，Webhook 仍在等待整個程序。因此出現 499 並不意外。
+
+現在的處理流程：
+1. 收到 POST /webhook，先檢查 LINE_CHANNEL_SECRET、LINE_CHANNEL_ACCESS_TOKEN，讀取原始 Body，驗證 x-line-signature（HMAC-SHA256）；簽章錯誤回 401、JSON 錯誤回 400，均不建立背景任務。
+2. 驗證通過後，將事件交給 Cloudflare ExecutionContext 的 ctx.waitUntil()，**不等待**股票查詢、Google Sheets、LINE Reply 完成，立即回 HTTP 200。空 events 也回 200。
+3. 在背景工作中保留 LINE 群組白名單、LINE_ADMIN_USER_IDS 管理員檢查、股票名稱官方名冊優先與 FinMind 備援、只改 Watchlist、寫入後讀回驗證。
+4. LINE Reply 與 Webhook HTTP 回應是兩個獨立動作：快速完成時回已驗證結果，超過 5 秒則先回「收到、處理中、尚未確認成功」，而非把更新失敗誤報成成功。不新增 LINE Push API 或其他計費流程。
+5. 背景工作發生未處理例外會記錄 webhook_processing_error（只記錄 Error 類型）；LINE API 非 2xx 另記錄 line_reply_failed 與 status。不要把 Webhook HTTP 200 當成 LINE 已送達或 Sheets 已完成的證明。
+6. Cloudflare ctx.waitUntil() 在 HTTP 回應後最多延續約 30 秒。這是目前的最小改動，而不是可靠工作佇列；如果外部服務長期超時仍可能被終止。需更強可靠性時才評估 Cloudflare Queues 等機制，不在這次擴大範圍。
+
+此版本的模擬驗收應包含：延遲讀取 350ms 時 Webhook HTTP 200 不受阻；慢速上櫃查詢在 HTTP 200 之後仍能完成寫入與 LINE Reply；既有 HMAC 401、無效 JSON 400、不在白名單的群組不能讀寫；原有 /觀察、/新增、/移除、/完整報告等功能仍通過回歸測試。
+
+正式部署指引：
+- 先備份線上 Worker，並以本功能分支固定 Commit 的 cloudflare-worker/index.mjs 整份替換後 Deploy；不修改其他 Secrets。
+- LINE 的 /版本 必須回覆 5.8.5，否則尚未部署此修正。
+- 先驗證 /測試 和 /觀察，然後使用已存在的代號做 /新增 測試，以免產生不需要的 Watchlist 紀錄。若回覆「已在觀察清單」代表讀取正常且沒有重複新增。
+- 只有真正想追蹤新股票時才測 /新增 3444／1260；收到「處理中」後稍後用 /觀察 確認結果，不要重送同一請求。
+- 觀察 Cloudflare Workers **Invocations 與 Observability Logs**、LINE Developers Console 的 Webhook error statistics。預期新的 POST /webhook 不因慢速外部 API 而出現大量 499；需要比對相同時間窗的請求量及 200/499 比例，不能只看某一筆 200。
+- 若仍有 499，核對是否為同一 Worker 的新部署、完整執行紀錄及 LINE error reason（尤其 request_timeout）；不公開 LINE token、群組 ID、User ID 或 Google 服務帳戶。
+
+官方文件：
+- https://developers.line.biz/en/docs/messaging-api/receiving-messages/
+- https://developers.line.biz/en/docs/messaging-api/check-webhook-error-statistics/
+- https://developers.cloudflare.com/workers/runtime-apis/context/
