@@ -22,6 +22,13 @@ jobs:
           python-version: "3.12"
       - run: uv sync --frozen
       - run: uv run pytest -q
+      - name: Step 5-3 read-only credential check
+        if: github.ref == 'refs/heads/test/step53-readonly-20261107'
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+        run: uv run python -m scripts.check_access
 
   frontend:
     runs-on: ubuntu-latest
