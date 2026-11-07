@@ -483,23 +483,122 @@ function colName(index) {
   return result;
 }
 
+
+// Official TWSE / TPEx security master lists; not price or live-quote APIs.
+// Code meanings are taken from official exchange industry classification.
+const TWSE_ETF_CATALOG = "https://openapi.twse.com.tw/v1/opendata/t187ap47_L";
+const TWSE_STOCK_CATALOG = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L";
+const TPEX_STOCK_CATALOG = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O";
+
+const INDUSTRY_CATEGORIES = Object.freeze({
+  "01": "水泥", "02": "食品", "03": "塑膠", "04": "紡織",
+  "05": "電機機械", "06": "電器電纜", "08": "玻璃陶瓷",
+  "09": "造紙", "10": "鋼鐵", "11": "橡膠", "12": "汽車",
+  "14": "建材營造", "15": "航運", "16": "觀光餐旅", "17": "金融",
+  "18": "貿易百貨", "19": "綜合", "20": "其他",
+  "21": "化學", "22": "生技醫療", "23": "油電燃氣",
+  "24": "半導體", "25": "電腦及週邊設備", "26": "光電",
+  "27": "通信網路", "28": "電子零組件", "29": "電子通路",
+  "30": "資訊服務", "31": "其他電子", "32": "文化創意",
+  "33": "農業科技", "35": "綠能環保", "36": "數位雲端",
+  "37": "運動休閒", "38": "居家生活", "80": "管理股票",
+});
+
+const officialSecurityCache = new Map();
+const OFFICIAL_SECURITY_CACHE_MS = 60 * 60 * 1000;
+
+async function readOfficialCatalog(url) {
+  const response = await fetch(url, {
+    method: "GET",
+    headers: { Accept: "application/json" },
+    signal: AbortSignal.timeout(6000),
+  });
+  if (!response.ok) throw new Error("Official stock directory unavailable");
+  const records = await response.json();
+  if (!Array.isArray(records) || records.length < 1 || records.length > 12000) {
+    throw new Error("Unexpected official stock directory schema");
+  }
+  return records;
+}
+
+function shortOfficialName(value) {
+  const name = String(value ?? "").trim();
+  if (!name || name.length > 35 || /[\r\n\t<>]/.test(name)) {
+    throw new Error("Invalid official stock name");
+  }
+  return name;
+}
+
+function matchCatalog(records, stockId, idColumn, nameColumn, industryColumn, market) {
+  const matches = records.filter((row) =>
+    row && typeof row === "object" &&
+    String(row[idColumn] ?? "").trim() === stockId
+  );
+  if (matches.length > 1) throw new Error("Duplicated official stock code");
+  if (!matches.length) return null;
+  const match = matches[0];
+  const name = shortOfficialName(match[nameColumn]);
+  if (market === "ETF") return { name, category: "ETF", source: "證交所 ETF 名冊" };
+  const industryCode = String(match[industryColumn] ?? "").trim().padStart(2, "0");
+  const category = INDUSTRY_CATEGORIES[industryCode];
+  if (!category) throw new Error("Unsupported official industry code");
+  return { name, category, source: market === "TWSE" ? "證交所上市公司名冊" : "櫃買中心上櫃公司名冊" };
+}
+
+async function lookupStockMetadata(stockId) {
+  if (!STOCK_ID_PATTERN.test(stockId)) throw new Error("Invalid stock ID");
+  const cached = officialSecurityCache.get(stockId);
+  if (cached && cached.expiry > Date.now()) return cached.metadata;
+
+  // Parallel public queries keep the LINE Reply API within its reply-token TTL.
+  const catalogs = [
+    { url: TWSE_ETF_CATALOG, id: "基金代號", name: "基金簡稱", industry: null, market: "ETF" },
+    { url: TWSE_STOCK_CATALOG, id: "公司代號", name: "公司簡稱", industry: "產業別", market: "TWSE" },
+    { url: TPEX_STOCK_CATALOG, id: "SecuritiesCompanyCode", name: "CompanyAbbreviation",
+      industry: "SecuritiesIndustryCode", market: "TPEX" },
+  ];
+  const responses = await Promise.allSettled(catalogs.map(async (spec) => {
+    const rows = await readOfficialCatalog(spec.url);
+    return matchCatalog(rows, stockId, spec.id, spec.name, spec.industry, spec.market);
+  }));
+  const valid = responses.filter((r) => r.status === "fulfilled" && r.value).map((r) => r.value);
+  if (valid.length > 1) throw new Error("Conflicting official stock listings");
+  if (!valid.length) {
+    if (responses.some((r) => r.status === "rejected")) {
+      throw new Error("Official stock directory not fully available");
+    }
+    return null;
+  }
+  officialSecurityCache.set(stockId, { expiry: Date.now() + OFFICIAL_SECURITY_CACHE_MS, metadata: valid[0] });
+  return valid[0];
+}
+
+function metadataIncomplete(current) {
+  return !current?.name || !current?.category ||
+    ["未分類", "待分類"].includes(current.category);
+}
+
 function parseWatchlist(values, stockId) {
   if (!values.length || !Array.isArray(values[0])) {
     throw new Error("Watchlist header missing");
   }
   const headers = values[0].map((v) => String(v).trim());
-  const required = ["stock_id", "enabled"];
+  const required = ["stock_id", "name", "category", "enabled"];
   if (required.some((column) => headers.indexOf(column) < 0) ||
       new Set(headers.filter(Boolean)).size !== headers.filter(Boolean).length) {
     throw new Error("Watchlist schema mismatch");
   }
   const stockCol = headers.indexOf("stock_id");
+  const nameCol = headers.indexOf("name");
+  const categoryCol = headers.indexOf("category");
   const enabledCol = headers.indexOf("enabled");
   const matches = [];
   for (let i = 1; i < values.length; i++) {
     if (String(values[i]?.[stockCol] ?? "").trim() === stockId) {
       matches.push({
         sheetRow: i + 1,
+        name: String(values[i]?.[nameCol] ?? "").trim(),
+        category: String(values[i]?.[categoryCol] ?? "").trim(),
         enabled: ["TRUE", "1", "YES"].includes(
           String(values[i]?.[enabledCol] ?? "").trim().toUpperCase()
         ),
@@ -507,7 +606,7 @@ function parseWatchlist(values, stockId) {
     }
   }
   if (matches.length > 1) throw new Error("Duplicate stock IDs in Watchlist");
-  return { headers, enabledCol, match: matches[0] || null };
+  return { headers, nameCol, categoryCol, enabledCol, match: matches[0] || null };
 }
 
 function isWatchlistAdmin(env, userId) {
@@ -570,21 +669,60 @@ async function changeWatchlist(env, action, stockId, name = "", category = "") {
   const sheet = parseWatchlist(before, stockId);
   const current = sheet.match;
 
+  let official = null;
+  let expectedName = current?.name || name;
+  let expectedCategory = current?.category || category;
+
   if (action === "add") {
-    if (current?.enabled) {
-      return "ℹ️ " + stockId + " 已在觀察清單內，無須重複新增。";
+    // A previously enabled but incomplete row (e.g. 0050 / 未分類)
+    // is repaired in place, without overwriting custom names/categories.
+    const needName = !current?.name && !name;
+    const needCategory = (!current?.category ||
+      ["未分類", "待分類"].includes(current.category)) && !category;
+    if ((!current || metadataIncomplete(current)) && (needName || needCategory)) {
+      try {
+        official = await lookupStockMetadata(stockId);
+      } catch {
+        return "⚠️ 官方證券基本資料暫時無法驗證，未變更 " + stockId +
+          "。請稍後重試，或明確提供股票名稱與類股。";
+      }
+      if (!official) {
+        return "⛔ 查無 " + stockId +
+          " 的上市 ETF／上市公司／上櫃公司官方基本資料，未新增或修改。";
+      }
     }
+    expectedName = current?.name || name || official?.name || "";
+    expectedCategory = (current?.category &&
+      !["未分類", "待分類"].includes(current.category))
+      ? current.category
+      : category || official?.category || "";
+
+    if (!expectedName || !expectedCategory) {
+      return "⚠️ 股票名稱或類股仍不完整，未變更觀察清單。";
+    }
+    if (current?.enabled && !metadataIncomplete(current)) {
+      return "ℹ️ " + stockId + " " + current.name + "（" +
+        current.category + "）已在觀察清單內，無須重複新增。";
+    }
+
     if (current) {
-      await writeWatchlistValue(
-        env, "update",
-        "'Watchlist'!" + colName(sheet.enabledCol) + current.sheetRow,
-        ["TRUE"]
-      );
+      const rowAddress = (columnIndex) =>
+        "'Watchlist'!" + colName(columnIndex) + current.sheetRow;
+      // Only write cells that actually require an update.
+      if (!current.enabled) {
+        await writeWatchlistValue(env, "update", rowAddress(sheet.enabledCol), ["TRUE"]);
+      }
+      if (!current.name) {
+        await writeWatchlistValue(env, "update", rowAddress(sheet.nameCol), [expectedName]);
+      }
+      if (!current.category || ["未分類", "待分類"].includes(current.category)) {
+        await writeWatchlistValue(env, "update", rowAddress(sheet.categoryCol), [expectedCategory]);
+      }
     } else {
       const row = sheet.headers.map((header) => {
         if (header === "stock_id") return stockId;
-        if (header === "name") return name;
-        if (header === "category") return category || "未分類";
+        if (header === "name") return expectedName;
+        if (header === "category") return expectedCategory;
         if (header === "enabled") return "TRUE";
         return "";
       });
@@ -603,17 +741,20 @@ async function changeWatchlist(env, action, stockId, name = "", category = "") {
   // Read back from Google before claiming the command took effect.
   const [after] = await readSheets(env, [WATCHLIST_WRITE_RANGE]);
   const verified = parseWatchlist(after, stockId).match;
-  if (!verified || verified.enabled !== (action === "add")) {
+  if (!verified || verified.enabled !== (action === "add") ||
+      (action === "add" &&
+        (verified.name !== expectedName || verified.category !== expectedCategory))) {
     throw new Error("Watchlist read-back verification failed");
   }
   if (action === "remove") {
     return "✅ " + stockId + " 已停用（enabled=FALSE），原有分析紀錄保留。輸入 /觀察 確認。";
   }
-  const missingName = !current && !name;
-  return "✅ " + stockId +
-    (current ? " 已重新啟用" : " 已新增到觀察清單") +
-    "（enabled=TRUE）。" +
-    (missingName ? "\n⚠️ 名稱未填、類股暫列「未分類」。請至 Watchlist 補充，或首次新增時使用 /新增 2882 國泰金 金融。" : "") +
+  const detail = stockId + " " + expectedName + "（" + expectedCategory + "）";
+  const actionText = current
+    ? current.enabled ? "已自動補齊原有觀察清單資料" : "已重新啟用並確認資料"
+    : "已新增到觀察清單";
+  return "✅ " + detail + " " + actionText + "（enabled=TRUE）。" +
+    (official ? "\n資料來源：" + official.source + "（非即時行情）。" : "") +
     "\n新的選股結果須等下次執行分析後才會產生。";
 }
 

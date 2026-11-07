@@ -86,6 +86,33 @@ async function simulate(command, opts = {}) {
         expires_in: 30,
       });
     }
+    if (u.host === "openapi.twse.com.tw" || u.host === "www.tpex.org.tw") {
+      calls.push({ type: "catalog", url: u.href });
+      if (opts.catalogUnavailable) {
+        return responseJson({ error: "official source unavailable" }, 503);
+      }
+      if (u.pathname.endsWith("/t187ap47_L")) {
+        return responseJson([
+          { "基金代號": "0050", "基金簡稱": "元大台灣50" },
+          { "基金代號": "006208", "基金簡稱": "富邦台50" },
+        ]);
+      }
+      if (u.pathname.endsWith("/t187ap03_L")) {
+        return responseJson([
+          { "公司代號": "2330", "公司簡稱": "台積電", "產業別": "24" },
+          { "公司代號": "2882", "公司簡稱": "國泰金", "產業別": "17" },
+          { "公司代號": "2603", "公司簡稱": "長榮", "產業別": "15" },
+          { "公司代號": "8888", "公司簡稱": "未知類股", "產業別": "99" },
+        ]);
+      }
+      if (u.pathname.endsWith("/mopsfin_t187ap03_O")) {
+        return responseJson([
+          { SecuritiesCompanyCode: "6488", CompanyAbbreviation: "環球晶",
+            SecuritiesIndustryCode: "24" },
+        ]);
+      }
+      throw new Error("Unknown official catalog endpoint");
+    }
     if (u.host === "sheets.googleapis.com" && u.pathname.endsWith("/values:batchGet")) {
       assert.equal(options.method, "GET");
       assert.equal(options.headers.Authorization, "Bearer read-token");
@@ -154,11 +181,12 @@ test("/我的ID without source.userId explains mobile/consent requirement", asyn
   assert.equal(calls.length, 0);
 });
 
-test("/新增 2882 only writes one new row with default category", async () => {
+test("/新增 2882 resolves official stock name and industry and writes one row", async () => {
   const { rows, calls, text } = await simulate("/新增 2882");
-  assert.deepEqual(rows.at(-1), ["2882", "", "未分類", "TRUE"]);
-  assert.match(text, /2882 已新增/);
-  assert.match(text, /名稱未填/);
+  assert.deepEqual(rows.at(-1), ["2882", "國泰金", "金融", "TRUE"]);
+  assert.match(text, /2882 國泰金（金融） 已新增/);
+  assert.match(text, /證交所上市公司名冊/);
+  assert.equal(calls.filter((c) => c.type === "catalog").length, 3);
   assert.equal(calls.filter((c) => c.type === "write").length, 1);
   assert.ok(calls.filter((c) => c.type === "oauth").some((c) => c.scope.endsWith("/spreadsheets")));
   assert.ok(calls.filter((c) => c.type === "oauth").some((c) => c.scope.endsWith(".readonly")));
@@ -167,13 +195,14 @@ test("/新增 2882 only writes one new row with default category", async () => {
 test("/新增 with a name and category uses user-supplied values, not invented lookup", async () => {
   const { rows, text } = await simulate("/新增 2882 國泰金 金融");
   assert.deepEqual(rows.at(-1), ["2882", "國泰金", "金融", "TRUE"]);
-  assert.doesNotMatch(text, /名稱未填/);
+  assert.doesNotMatch(text, /未分類/);
 });
 
-test("/新增 006208 preserves six-digit ETF codes exactly", async () => {
+test("/新增 006208 auto-detects ETF and preserves six-digit code", async () => {
   const { rows, text } = await simulate("/新增 006208");
-  assert.equal(rows.at(-1)[0], "006208");
-  assert.match(text, /006208 已新增/);
+  assert.deepEqual(rows.at(-1), ["006208", "富邦台50", "ETF", "TRUE"]);
+  assert.match(text, /006208 富邦台50（ETF） 已新增/);
+  assert.match(text, /證交所 ETF 名冊/);
 });
 
 test("/新增 already enabled returns idempotent message without any update", async () => {
@@ -182,6 +211,7 @@ test("/新增 already enabled returns idempotent message without any update", as
   assert.match(text, /已在觀察清單/);
   assert.equal(calls.filter((c) => c.type === "write").length, 0);
   assert.ok(calls.some((c) => c.type === "read"));
+  assert.equal(calls.filter((c) => c.type === "catalog").length, 0);
 });
 
 test("/新增 re-enables disabled row without replacing its name or category", async () => {
@@ -300,4 +330,84 @@ test("/新增 writes no formulas, score or existing signal rows", async () => {
   assert.deepEqual(result.rows[4], ["2603", "長榮", "航運", "TRUE"]);
   assert.equal(result.calls.filter((c) => c.type === "write").length, 1);
   assert.ok(result.calls.filter((c) => c.type === "write").every(c => c.url.includes("Watchlist")));
+});
+
+
+test("/新增 0050 repairs an already enabled row with blank name and 未分類", async () => {
+  const rows = [
+    ["stock_id", "name", "category", "enabled"],
+    ["0050", "", "未分類", "TRUE"],
+  ];
+  const result = await simulate("/新增 0050", { rows });
+  assert.deepEqual(result.rows[1], ["0050", "元大台灣50", "ETF", "TRUE"]);
+  assert.match(result.text, /已自動補齊原有觀察清單資料/);
+  assert.match(result.text, /證交所 ETF 名冊/);
+  assert.equal(result.rows.length, 2);
+  assert.equal(result.calls.filter((x) => x.type === "write").length, 2);
+});
+
+test("/新增 0050 preserves a custom label and fills only missing category", async () => {
+  const rows = [
+    ["stock_id", "name", "category", "enabled"],
+    ["0050", "我的台灣50", "未分類", "TRUE"],
+  ];
+  const result = await simulate("/新增 0050", { rows });
+  assert.deepEqual(result.rows[1], ["0050", "我的台灣50", "ETF", "TRUE"]);
+  assert.equal(result.calls.filter((c) => c.type === "write").length, 1);
+});
+
+test("/新增 6488 resolves TPEX name and official industry into category", async () => {
+  const { rows, text } = await simulate("/新增 6488");
+  assert.deepEqual(rows.at(-1), ["6488", "環球晶", "半導體", "TRUE"]);
+  assert.match(text, /櫃買中心上櫃公司名冊/);
+});
+
+test("/新增 unknown ticker fails closed, never appends fake metadata", async () => {
+  const result = await simulate("/新增 9999");
+  assert.deepEqual(result.rows, original);
+  assert.match(result.text, /查無 9999 的上市 ETF／上市公司／上櫃公司官方基本資料/);
+  assert.equal(result.calls.filter((c) => c.type === "write").length, 0);
+});
+
+test("official data API errors never silently store blank name or 未分類", async () => {
+  const result = await simulate("/新增 7777", { catalogUnavailable: true });
+  assert.deepEqual(result.rows, original);
+  assert.match(result.text, /官方證券基本資料暫時無法驗證/);
+  assert.equal(result.calls.filter((c) => c.type === "write").length, 0);
+});
+
+test("existing incomplete data is not overwritten when official service is unreachable", async () => {
+  const rows = [
+    ["stock_id", "name", "category", "enabled"],
+    ["7777", "", "未分類", "TRUE"],
+  ];
+  const result = await simulate("/新增 7777", { rows, catalogUnavailable: true });
+  assert.deepEqual(result.rows, rows);
+  assert.equal(result.calls.filter((c) => c.type === "write").length, 0);
+});
+
+test("manual /新增 name and category still works without a catalog lookup", async () => {
+  const result = await simulate("/新增 2882 國泰金 金融", { catalogUnavailable: true });
+  assert.deepEqual(result.rows.at(-1), ["2882", "國泰金", "金融", "TRUE"]);
+  assert.equal(result.calls.filter((c) => c.type === "catalog").length, 0);
+});
+
+test("unknown industry metadata never guesses a category", async () => {
+  // Test an official company whose industry code is absent from the approved mapping.
+  const result = await simulate("/新增 8888");
+  assert.equal(result.calls.filter((c) => c.type === "write").length, 0);
+  assert.deepEqual(result.rows, original);
+});
+
+
+test("/新增 can re-enable and fill an incomplete disabled ETF in place", async () => {
+  const rows = [
+    ["stock_id", "name", "category", "enabled"],
+    ["0050", "", "未分類", "FALSE"],
+  ];
+  const result = await simulate("/新增 0050", { rows });
+  assert.deepEqual(result.rows[1], ["0050", "元大台灣50", "ETF", "TRUE"]);
+  assert.equal(result.rows.length, 2);
+  assert.match(result.text, /已重新啟用並確認資料/);
+  assert.equal(result.calls.filter((c) => c.type === "write").length, 3);
 });
