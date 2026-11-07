@@ -95,6 +95,7 @@ async function simulate(command, opts = {}) {
         return responseJson([
           { "基金代號": "0050", "基金簡稱": "元大台灣50" },
           { "基金代號": "006208", "基金簡稱": "富邦台50" },
+          { "基金代號": "00685L", "基金簡稱": "群益臺灣加權正2" },
         ]);
       }
       if (u.pathname.endsWith("/t187ap03_L")) {
@@ -109,6 +110,22 @@ async function simulate(command, opts = {}) {
         return responseJson([
           { SecuritiesCompanyCode: "6488", CompanyAbbreviation: "環球晶",
             SecuritiesIndustryCode: "24" },
+          { SecuritiesCompanyCode: "3260", CompanyAbbreviation: "威剛",
+            SecuritiesIndustryCode: "24" },
+        ]);
+      }
+      if (u.pathname.endsWith("/mopsfin_t187ap03_R")) {
+        return responseJson([
+          { SecuritiesCompanyCode: "1260", CompanyAbbreviation: "富味鄉",
+            SecuritiesIndustryCode: "02" },
+          { SecuritiesCompanyCode: "7756", CompanyAbbreviation: "多那之",
+            SecuritiesIndustryCode: "16" },
+        ]);
+      }
+      if (u.pathname.endsWith("/tpex_mainboard_quotes")) {
+        return responseJson([
+          { SecuritiesCompanyCode: "00687B", CompanyName: "國泰20年美債" },
+          { SecuritiesCompanyCode: "009825", CompanyName: "聯邦美國金融創新" },
         ]);
       }
       throw new Error("Unknown official catalog endpoint");
@@ -338,7 +355,7 @@ test("/新增 writes no formulas, score or existing signal rows", async () => {
 
 test("/版本 identifies deployed Worker source without Google calls", async () => {
   const { text, calls } = await simulate("/版本");
-  assert.match(text, /5\.8\.1/);
+  assert.match(text, /5\.8\.2/);
   assert.equal(calls.length, 0);
 });
 
@@ -423,4 +440,87 @@ test("/新增 can re-enable and fill an incomplete disabled ETF in place", async
   assert.equal(result.rows.length, 2);
   assert.match(result.text, /已重新啟用並確認資料/);
   assert.equal(result.calls.filter((c) => c.type === "write").length, 3);
+});
+
+
+test("/新增 00685L auto-resolves leveraged ETF and warns about ordinary-stock strategy", async () => {
+  const { rows, calls, text } = await simulate("/新增 00685L");
+  assert.deepEqual(rows.at(-1), ["00685L", "群益臺灣加權正2", "ETF", "TRUE"]);
+  assert.match(text, /槓桿及反向 ETF/);
+  assert.match(text, /證交所 ETF 名冊/);
+  assert.deepEqual(calls.filter((c) => c.type === "catalog").map((c) => new URL(c.url).pathname),
+    ["/v1/opendata/t187ap47_L"]);
+});
+
+test("/新增 accepts lowercase 00685l and stores canonical uppercased 00685L", async () => {
+  const { rows } = await simulate("/新增 00685l");
+  assert.equal(rows.at(-1)[0], "00685L");
+});
+
+test("/新增 00687B finds an OTC bond ETF from official TPEx market listing", async () => {
+  const { rows, calls, text } = await simulate("/新增 00687B");
+  assert.deepEqual(rows.at(-1), ["00687B", "國泰20年美債", "ETF", "TRUE"]);
+  assert.match(text, /櫃買上櫃行情名冊/);
+  assert.deepEqual(calls.filter((c) => c.type === "catalog").map((c) => new URL(c.url).pathname), [
+    "/v1/opendata/t187ap47_L", "/openapi/v1/tpex_mainboard_quotes",
+  ]);
+});
+
+test("/新增 1260 reads official TPEx emerging-company directory", async () => {
+  const { rows, text, calls } = await simulate("/新增 1260");
+  assert.deepEqual(rows.at(-1), ["1260", "富味鄉", "興櫃／食品", "TRUE"]);
+  assert.match(text, /櫃買中心興櫃公司名冊/);
+  assert.match(text, /沒有一般股票的開盤價/);
+  assert.deepEqual(calls.filter((c) => c.type === "catalog").map((c) => new URL(c.url).pathname), [
+    "/openapi/v1/mopsfin_t187ap03_R",
+  ]);
+});
+
+test("/新增 7756 searches emerging first and names the venue", async () => {
+  const { rows, calls } = await simulate("/新增 7756");
+  assert.deepEqual(rows.at(-1), ["7756", "多那之", "興櫃／觀光餐旅", "TRUE"]);
+  assert.deepEqual(calls.filter((c) => c.type === "catalog").map((c) => new URL(c.url).pathname), [
+    "/openapi/v1/mopsfin_t187ap03_R",
+  ]);
+});
+
+test("/新增 3260 remains an OTC stock (not emerging)", async () => {
+  const { rows, calls } = await simulate("/新增 3260");
+  assert.deepEqual(rows.at(-1), ["3260", "威剛", "半導體", "TRUE"]);
+  assert.deepEqual(calls.filter((c) => c.type === "catalog").map((c) => new URL(c.url).pathname), [
+    "/v1/opendata/t187ap03_L", "/openapi/v1/mopsfin_t187ap03_O",
+  ]);
+});
+
+test("/移除 00685L disables exact alphanumeric row without erasing its name", async () => {
+  const rows = [...structuredClone(original), ["00685L", "群益臺灣加權正2", "ETF", "TRUE"]];
+  const result = await simulate("/移除 00685L", { rows });
+  assert.deepEqual(result.rows.at(-1), ["00685L", "群益臺灣加權正2", "ETF", "FALSE"]);
+  assert.equal(result.calls.filter((c) => c.type === "write").length, 1);
+});
+
+test("/新增 00685L re-enables previously disabled leveraged ETF without duplication", async () => {
+  const rows = [...structuredClone(original), ["00685L", "群益臺灣加權正2", "ETF", "FALSE"]];
+  const result = await simulate("/新增 00685L", { rows });
+  assert.deepEqual(result.rows.at(-1), ["00685L", "群益臺灣加權正2", "ETF", "TRUE"]);
+  assert.equal(result.rows.length, rows.length);
+  assert.equal(result.calls.filter((c) => c.type === "catalog").length, 0);
+});
+
+test("/觀察 shows alphanumeric ETF and emerging rows after an add", async () => {
+  const rows = [...structuredClone(original),
+    ["00685L", "群益臺灣加權正2", "ETF", "TRUE"],
+    ["1260", "富味鄉", "興櫃／食品", "TRUE"]];
+  const { text } = await simulate("/觀察", { rows });
+  assert.match(text, /00685L 群益臺灣加權正2/);
+  assert.match(text, /1260 富味鄉/);
+});
+
+test("invalid alphanumeric stock IDs fail closed before Sheets reads", async () => {
+  for (const command of ["/新增 00685LL", "/新增 L00685", "/新增 00B85L",
+    "/新增 00685_", "/移除 00685LL", "/新增 1234567L"]) {
+    const result = await simulate(command);
+    assert.match(result.text, /用法/);
+    assert.equal(result.calls.length, 0);
+  }
 });

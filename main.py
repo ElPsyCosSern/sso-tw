@@ -31,7 +31,7 @@ from stock_strategies.sheet import (
 from stock_strategies.evaluate import evaluate
 from stock_strategies.notify import format_messages
 from stock_strategies.reporting import daily_status, taiwan_today, daily_data_date
-from stock_strategies.market import get_market_state, apply_market_filter
+from stock_strategies.market import get_market_state, apply_market_filter, apply_instrument_safety_filter
 from stock_strategies.night_session import (
     get_night_session,
     apply_night_filter,
@@ -82,6 +82,11 @@ def main():
         if r:
             results.append(r)
         time.sleep(0.6)
+
+    # 3b. ETF 與興櫃並非普通股開盤／EPS-ROE 模型，禁止通用策略直接輸出 BUY。
+    instrument_downgraded = apply_instrument_safety_filter(results, watchlist)
+    if instrument_downgraded:
+        print(f"⚠️ ETF／興櫃 {instrument_downgraded} 檔 BUY 改為 WATCH（策略尚未適用）")
 
     # 4. 套用大盤濾鏡：跌破月線時 BUY 一律降為 WATCH
     downgraded = apply_market_filter(results, market)

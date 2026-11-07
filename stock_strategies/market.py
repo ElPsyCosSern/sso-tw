@@ -44,3 +44,43 @@ def apply_market_filter(results: list[dict], market: dict) -> int:
             r.setdefault("risk_notes", []).append("大盤跌破月線，自動降為 WATCH")
             downgraded += 1
     return downgraded
+
+
+
+def apply_instrument_safety_filter(results: list[dict], watchlist: list[dict]) -> int:
+    """Guard legacy common-stock BUY rules for ETF and emerging-board securities.
+
+    The generic EPS/ROE gate was designed for listed companies, not ETF funds.
+    Emerging-board securities have negotiated trading and no opening auction
+    price. Keep reference signals for research but never auto-upgrade to BUY.
+    """
+    categories = {
+        str(row.get("stock_id", "")).strip().upper(): str(row.get("category", "")).strip()
+        for row in watchlist
+    }
+    downgraded = 0
+    for result in results:
+        stock_id = str(result.get("stock_id", "")).strip().upper()
+        category = categories.get(stock_id, "")
+        is_etf = category == "ETF"
+        is_emerging = category.startswith("興櫃／")
+        if not is_etf and not is_emerging:
+            continue
+        notes = result.setdefault("risk_notes", [])
+        if result.get("action") == "BUY":
+            result["action"] = "WATCH"
+            downgraded += 1
+
+        if is_emerging:
+            warning = "興櫃採議價交易，無一般開盤價；原隔日開盤進場模型不適用"
+            if "entry_rule" in result:
+                result["entry_rule"] = warning
+        else:
+            warning = "ETF 不適用普通股 EPS／ROE 基本面模型；訊號僅供觀察"
+            if stock_id.endswith(("L", "R")):
+                warning += "；槓桿／反向 ETF 應留意每日倍數及複利路徑風險"
+            if "entry_rule" in result:
+                result["entry_rule"] = warning
+        if warning not in notes:
+            notes.append(warning)
+    return downgraded

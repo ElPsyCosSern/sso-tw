@@ -469,7 +469,9 @@ async function watchlistMessage(env) {
 
 
 const WATCHLIST_WRITE_RANGE = "'Watchlist'";
-const STOCK_ID_PATTERN = /^[0-9]{4,6}$/;
+// Taiwan securities are usually 4–6 digits; ETF suffixes may be letters
+// (e.g. 00685L leveraged ETF, 00687B bond ETF, 00980A active ETF).
+const STOCK_ID_PATTERN = /^[0-9]{4,6}[A-Z]?$/;
 
 function colName(index) {
   if (!Number.isSafeInteger(index) || index < 0) throw new Error("Invalid column");
@@ -489,6 +491,8 @@ function colName(index) {
 const TWSE_ETF_CATALOG = "https://openapi.twse.com.tw/v1/opendata/t187ap47_L";
 const TWSE_STOCK_CATALOG = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L";
 const TPEX_STOCK_CATALOG = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O";
+const TPEX_EMERGING_CATALOG = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_R";
+const TPEX_ETF_QUOTES = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes";
 
 const INDUSTRY_CATEGORIES = Object.freeze({
   "01": "水泥", "02": "食品", "03": "塑膠", "04": "紡織",
@@ -539,10 +543,16 @@ function matchCatalog(records, stockId, idColumn, nameColumn, industryColumn, ma
   const match = matches[0];
   const name = shortOfficialName(match[nameColumn]);
   if (market === "ETF") return { name, category: "ETF", source: "證交所 ETF 名冊" };
+  if (market === "OTC_ETF") return { name, category: "ETF", source: "櫃買上櫃行情名冊（ETF 代號規則辨識）" };
   const industryCode = String(match[industryColumn] ?? "").trim().padStart(2, "0");
   const category = INDUSTRY_CATEGORIES[industryCode];
   if (!category) throw new Error("Unsupported official industry code");
-  return { name, category, source: market === "TWSE" ? "證交所上市公司名冊" : "櫃買中心上櫃公司名冊" };
+  return {
+    name,
+    category: market === "EMERGING" ? "興櫃／" + category : category,
+    source: market === "TWSE" ? "證交所上市公司名冊" :
+      market === "EMERGING" ? "櫃買中心興櫃公司名冊" : "櫃買中心上櫃公司名冊",
+  };
 }
 
 async function lookupStockMetadata(stockId) {
@@ -557,11 +567,20 @@ async function lookupStockMetadata(stockId) {
   const listed = { url: TWSE_STOCK_CATALOG, id: "公司代號", name: "公司簡稱", industry: "產業別", market: "TWSE" };
   const otc = { url: TPEX_STOCK_CATALOG, id: "SecuritiesCompanyCode",
     name: "CompanyAbbreviation", industry: "SecuritiesIndustryCode", market: "TPEX" };
-  const catalogs = stockId.startsWith("00")
-    ? [etf, listed, otc]
-    : stockId.startsWith("6")
-      ? [otc, listed, etf]
-      : [listed, otc, etf];
+  const emerging = { url: TPEX_EMERGING_CATALOG, id: "SecuritiesCompanyCode",
+    name: "CompanyAbbreviation", industry: "SecuritiesIndustryCode", market: "EMERGING" };
+  const otcEtf = { url: TPEX_ETF_QUOTES, id: "SecuritiesCompanyCode",
+    name: "CompanyName", market: "OTC_ETF" };
+  // Stock codes aren't a reliable way to distinguish TWSE / TPEx / emerging.
+  // Only ETF code shape is used to skip irrelevant company directories; each
+  // identification must still be confirmed against an official live listing.
+  const catalogs = /^00[0-9]{2,4}[A-Z]?$/.test(stockId)
+    ? [etf, otcEtf]
+    : /^[17]/.test(stockId)
+      ? [emerging, listed, otc]
+      : /^[68]/.test(stockId)
+        ? [otc, emerging, listed]
+        : [listed, otc, emerging];
   let anyFailure = false;
   for (const spec of catalogs) {
     try {
@@ -762,8 +781,14 @@ async function changeWatchlist(env, action, stockId, name = "", category = "") {
   const actionText = current
     ? current.enabled ? "已自動補齊原有觀察清單資料" : "已重新啟用並確認資料"
     : "已新增到觀察清單";
+  const specialRisk = expectedCategory.startsWith("興櫃／")
+    ? "\n⚠️ 興櫃採議價交易，沒有一般股票的開盤價；普通股選股策略僅能作參考。"
+    : expectedCategory === "ETF"
+      ? "\n⚠️ ETF 不適用一般公司 EPS／ROE 門檻；槓桿及反向 ETF 更須注意每日倍數與持有期間風險。"
+      : "";
   return "✅ " + detail + " " + actionText + "（enabled=TRUE）。" +
     (official ? "\n資料來源：" + official.source + "（非即時行情）。" : "") +
+    specialRisk +
     "\n新的選股結果須等下次執行分析後才會產生。";
 }
 
@@ -961,7 +986,7 @@ function extractOriginalStockDetail(batch, stockId) {
   if (start < 0) return [];
   let end = start + 1;
   while (end < lines.length &&
-      !/^\*?[0-9]{4,6}\s/.test(lines[end]) &&
+      !/^\*?[0-9]{4,6}[A-Z]?\s/.test(lines[end]) &&
       !/^[🟢🟡]\s*\*?(?:BUY|WATCH)/.test(lines[end])) {
     end++;
   }
@@ -1124,7 +1149,7 @@ export default {
         if (command === "/測試") {
           message = "✅ LINE 機器人連線成功！";
         } else if (command === "/版本") {
-          message = "🛠️ stock-line-bot／5.8.1（官方名冊查詢最佳化）";
+          message = "🛠️ stock-line-bot／5.8.2（上櫃、興櫃及英文尾碼支援）";
         } else if (command === "/我的ID") {
           message = event.source.userId
             ? "🔐 你的 LINE User ID：" + event.source.userId +
@@ -1133,12 +1158,12 @@ export default {
         } else if (command.startsWith("/新增") || command.startsWith("/移除")) {
           const isAdd = command.startsWith("/新增");
           const match = isAdd
-            ? command.match(/^\/新增\s+([0-9]{4,6})(?:\s+([^\s]{1,30}))?(?:\s+([^\s]{1,30}))?$/u)
-            : command.match(/^\/移除\s+([0-9]{4,6})$/u);
+            ? command.match(/^\/新增\s+([0-9]{4,6}[A-Za-z]?)(?:\s+([^\s]{1,30}))?(?:\s+([^\s]{1,30}))?$/u)
+            : command.match(/^\/移除\s+([0-9]{4,6}[A-Za-z]?)$/u);
           if (!match) {
             message = isAdd
-              ? "用法：/新增 2882 或 /新增 2882 國泰金 金融（僅支援 4～6 位數字代號）"
-              : "用法：/移除 2882（僅支援 4～6 位數字代號）";
+              ? "用法：/新增 2882、/新增 00685L（支援數字與英文尾碼）"
+              : "用法：/移除 2882、/移除 00685L（支援數字與英文尾碼）";
           } else if (!String(env.LINE_ADMIN_USER_IDS || "").trim()) {
             message = "⛔ 尚未設定 LINE_ADMIN_USER_IDS，觀察清單寫入功能維持停用。";
           } else if (!event.source.userId) {
@@ -1148,7 +1173,7 @@ export default {
           } else {
             try {
               message = await changeWatchlist(
-                env, isAdd ? "add" : "remove", match[1], match[2] || "", match[3] || ""
+                env, isAdd ? "add" : "remove", match[1].toUpperCase(), match[2] || "", match[3] || ""
               );
             } catch {
               message = "⚠️ Watchlist 更新或回讀驗證失敗，請先用 /觀察 確認資料，再決定是否重試。";
@@ -1207,16 +1232,16 @@ export default {
                 "/完整報告－四大研究報告\n" +
                 "/報告 2－完整報告續頁\n" +
                 "/觀察、/績效、/資料測試－既有查詢\n" +
-                "/新增 2882－新增／重新啟用（管理員）\n" +
+                "/新增 2882／00685L－自動辨識及啟用（管理員）\n" +
                 "/移除 2882－停用但保留歷史（管理員）\n" +
                 "/我的ID－取得管理員設定用 User ID\n" +
                 "/版本－確認 Worker 是否已更新\n" +
                 "僅供研究參考，所有行情日期請以回覆標示為準。";
             } else {
-              const match = command.match(/^\/個股\s+([0-9]{4,6})$/);
+              const match = command.match(/^\/個股\s+([0-9]{4,6}[A-Za-z]?)$/u);
               message = match
-                ? await individualStockMessage(env, match[1])
-                : "用法：/個股 2330（請填寫 4～6 位數的台股代號）";
+                ? await individualStockMessage(env, match[1].toUpperCase())
+                : "用法：/個股 2330（可填 2330、00685L 等台股代號）";
             }
           } catch {
             message = command === "/資料測試"

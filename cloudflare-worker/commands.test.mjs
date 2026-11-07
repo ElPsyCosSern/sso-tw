@@ -464,3 +464,16 @@ test("unauthorized LINE groups cannot request any of the new full reports", asyn
     assert.equal(result.accesses.length,0);
   }
 });
+
+
+test("/個股 accepts ETF codes with letter suffix (00685L, 00687B)", async () => {
+  for (const stockId of ["00685L", "00687B"]) {
+    const { text } = await query("/個股 " + stockId);
+    assert.match(text, new RegExp(stockId));
+    assert.doesNotMatch(text, /用法：/);
+  }
+  const lower = await query("/個股 00685l");
+  assert.match(lower.text, /00685L/);
+  const invalid = await query("/個股 00685LL");
+  assert.match(invalid.text, /用法：/);
+});
