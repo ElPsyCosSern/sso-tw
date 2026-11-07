@@ -124,7 +124,7 @@ https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheet
 7. 即使 webhook 重送，Google Sheets append 也沒有跨 Worker instance 的原子性；極短時間對同一代號同時操作仍可能重複。此修正沒有新增資料庫、佇列或額外儲存層。
 
 上線驗收：
-- 先備份原 Worker，部署後 LINE 的 /版本 必須顯示 5.8.3。
+- 先備份原 Worker，部署後 LINE 的 /版本 必須顯示最新版 5.8.4。
 - 在已設定管理員的私人群組先用 /觀察 查看原本股票，再用 /新增 已存在代號 檢查應回覆「已在觀察清單」，不要為測試隨意新增不需要的股票。
 - 用真正要新增的股票測試：快則收到「✅ 已新增」；較慢則收到「⏳ 已收到，正在處理」。稍後以 /觀察 確認新增，並檢查 Watchlist 沒有重複。
 - 如果仍無回覆，Cloudflare Dashboard → Workers & Pages → stock-line-bot → Observability / Logs，查該時間附近的 line_reply_failed、line_reply_transport_error、invocation status（例如 exceededCpu）。請提供錯誤類型或狀態碼，不要提供完整 webhook request、密鑰或身分識別資料。
@@ -133,3 +133,32 @@ https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheet
 https://developers.line.biz/en/reference/messaging-api/
 https://developers.line.biz/en/docs/messaging-api/pricing/
 https://developers.cloudflare.com/workers/runtime-apis/context/
+
+
+## Step 5.8.4｜上櫃／興櫃官方 OpenAPI 被拒時的備援（3444）
+
+問題重現：
+- 3444 是利機（上櫃，產業代碼 29，電子通路）；2026-11-07 Windows 實測櫃買 mopsfin_t187ap03_O 回 HTTP 200，找到正確名稱與分類。
+- 同一網址在另一網路查詢環境曾回 HTTP 403；**這顯示可能存在依來源 IP 的存取限制，不代表已取得 Cloudflare 正式的 403 紀錄**。
+- 1260 富味鄉則在興櫃 mopsfin_t187ap03_R，可能遇到類似網路限制。
+
+處理方式：
+1. 正常情況**仍以證交所／櫃買中心官方名冊為優先**。官方 API 取得正確資料後，不使用備援。
+2. 當官方來源錯誤、逾時或被拒絕時，才使用現有研究系統已採用的 **FinMind 免費 TaiwanStockInfo API**，以 dataset=TaiwanStockInfo&data_id=股票代號 單檔查詢。**不需要新 Secret、API Token、付費方案或新增 Google Sheets 欄位**。
+3. FinMind 依 stock_id、stock_name、industry_category、type、date 驗證，保留最新日期的市場別（twse／tpex／emerging），避免把已轉板股票誤認為興櫃。只接受資料標籤日期在臺灣今日前 14 天內（或最多提前 1 天）。無資料、來源限流、日期過舊、名稱或市場別衝突時**拒絕新增**，不填入猜測資訊。
+4. 自動將電子通路業／電子通路類對應為「電子通路」，食品工業對應「食品」；興櫃仍標「興櫃／類股」，ETF 保留專用風險註記。
+5. 正式 LINE 回覆中明示「FinMind TaiwanStockInfo（第三方備援）」及資料日期，**不將第三方資料誤稱為官方直接驗證**。新增 Watchlist 不等於已完成選股分析。
+6. Cloudflare Logs 新增不含敏感資訊的診斷事件：security_directory_primary_failed（市場別、HTTP status）、security_directory_backup_used、security_directory_backup_failed。不會記錄 LINE User ID、Group ID、Reply Token、Google Secrets 或個人 Watchlist 內容。
+7. 已有的 5.8.3「5 秒內 Reply／逾時先告知處理中」機制保留；若備援也失敗，應看到未變更訊息（或先看到處理中，隨後用 /觀察 確認）。
+
+驗收方法：
+- 備份現有 Cloudflare Worker 並部署新版後，LINE 的 /版本 應回覆 **5.8.4**。
+- 輸入 /新增 3444，應顯示「3444 利機（電子通路）」；/新增 1260 應顯示「1260 富味鄉（興櫃／食品）」。若股票已存在且資料完整，應顯示「已在觀察清單」而不是重複建立。
+- /觀察 與 Google Sheets 的 Watchlist 應一致，stock_id 不得重複；只加入實際需要的股票。
+- 若仍無法新增，請在 Cloudflare Dashboard → Workers & Pages → stock-line-bot → Observability → Logs 提供 security_directory_primary_failed 的 HTTP status、是否出現 security_directory_backup_used，以及 line_reply_failed 狀態碼，**不要分享完整請求或金鑰**。
+- 原有 main、正式 GitHub 排程、Sheets 寫入權限、管理員白名單與 LINE 回覆額度規則均不因本次更新而變動。
+
+相關文件：
+- 官方櫃買資料：https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O
+- 興櫃資料：https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_R
+- FinMind 免費台股總覽：https://finmind.github.io/tutor/TaiwanMarket/Technical/

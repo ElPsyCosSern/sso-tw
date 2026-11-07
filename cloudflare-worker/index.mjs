@@ -493,6 +493,8 @@ const TWSE_STOCK_CATALOG = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L";
 const TPEX_STOCK_CATALOG = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O";
 const TPEX_EMERGING_CATALOG = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_R";
 const TPEX_ETF_QUOTES = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes";
+// Existing system already uses FinMind. Free, per-code listing fallback needs no API key.
+const FINMIND_INFO_URL = "https://api.finmindtrade.com/api/v4/data";
 
 const INDUSTRY_CATEGORIES = Object.freeze({
   "01": "水泥", "02": "食品", "03": "塑膠", "04": "紡織",
@@ -517,7 +519,11 @@ async function readOfficialCatalog(url) {
     headers: { Accept: "application/json" },
     signal: AbortSignal.timeout(6000),
   });
-  if (!response.ok) throw new Error("Official stock directory unavailable");
+  if (!response.ok) {
+    const error = new Error("Official stock directory unavailable");
+    error.httpStatus = response.status;
+    throw error;
+  }
   const records = await response.json();
   if (!Array.isArray(records) || records.length < 1 || records.length > 12000) {
     throw new Error("Unexpected official stock directory schema");
@@ -555,6 +561,72 @@ function matchCatalog(records, stockId, idColumn, nameColumn, industryColumn, ma
   };
 }
 
+
+/**
+ * FinMind's free TaiwanStockInfo supports per-code queries. It acts only as a
+ * fail-closed backup when exchange OpenAPI is unavailable (e.g. egress HTTP 403).
+ * The source is identified as third-party, not disguised as an exchange record.
+ */
+async function lookupFinMindBackup(stockId) {
+  const url = new URL(FINMIND_INFO_URL);
+  url.searchParams.set("dataset", "TaiwanStockInfo");
+  url.searchParams.set("data_id", stockId);
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    headers: { Accept: "application/json" },
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!response.ok) throw new Error("FinMind directory unavailable");
+  const payload = await response.json();
+  if (payload?.msg !== "success" || Number(payload.status) !== 200 ||
+      !Array.isArray(payload.data) || payload.data.length > 80) {
+    throw new Error("Unexpected FinMind data schema");
+  }
+
+  const matching = payload.data.filter((entry) =>
+    entry && typeof entry === "object" &&
+    String(entry.stock_id ?? "").trim() === stockId
+  );
+  if (!matching.length) return null;
+  // FinMind may retain older 'emerging' rows after an exchange transfer:
+  // only the newest market/date for this symbol is acceptable.
+  const ordered = matching.sort((a, b) =>
+    String(b.date ?? "").localeCompare(String(a.date ?? ""))
+  );
+  const latest = ordered[0];
+  const date = String(latest.date ?? "");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error("Invalid FinMind date");
+  const ageDays = (Date.parse(taiwanDate() + "T00:00:00Z") -
+    Date.parse(date + "T00:00:00Z")) / 86400000;
+  if (!Number.isFinite(ageDays) || ageDays < -1 || ageDays > 14) {
+    throw new Error("Stale FinMind security directory");
+  }
+  const name = shortOfficialName(latest.stock_name);
+  const type = String(latest.type ?? "").trim().toLowerCase();
+  if (!["twse", "tpex", "otc", "emerging"].includes(type) ||
+      ordered.some((row) =>
+        row.date === date &&
+        (shortOfficialName(row.stock_name) !== name ||
+          String(row.type).trim().toLowerCase() !== type))) {
+    throw new Error("Conflicting FinMind market metadata");
+  }
+  const rawCategory = String(latest.industry_category ?? "").trim();
+  if (!rawCategory || rawCategory.length > 24 ||
+      /[\u0000-\u001f\u007f<>]/.test(rawCategory)) {
+    throw new Error("Invalid FinMind category");
+  }
+  const normalized = rawCategory.replace(/(?:工業|業|類)$/u, "");
+  const aliases = { "紡織纖維": "紡織", "金融保險": "金融" };
+  const sector = aliases[normalized] || normalized;
+  const category = /ETF/i.test(rawCategory)
+    ? "ETF" : type === "emerging"
+      ? "興櫃／" + sector : sector;
+  return {
+    name, category,
+    source: "FinMind TaiwanStockInfo（第三方備援，資料日 " + date + "）",
+  };
+}
+
 async function lookupStockMetadata(stockId) {
   if (!STOCK_ID_PATTERN.test(stockId)) throw new Error("Invalid stock ID");
   const cached = officialSecurityCache.get(stockId);
@@ -582,22 +654,55 @@ async function lookupStockMetadata(stockId) {
         ? [otc, emerging, listed]
         : [listed, otc, emerging];
   let anyFailure = false;
+  let backupTried = false;
+  const acceptMetadata = (metadata) => {
+    officialSecurityCache.set(stockId, {
+      expiry: Date.now() + OFFICIAL_SECURITY_CACHE_MS,
+      metadata,
+    });
+    return metadata;
+  };
+  const tryBackup = async () => {
+    if (backupTried) return null;
+    backupTried = true;
+    try {
+      const backup = await lookupFinMindBackup(stockId);
+      if (backup) {
+        console.info("security_directory_backup_used", { source: "FinMind" });
+      }
+      return backup;
+    } catch (error) {
+      console.warn("security_directory_backup_failed", {
+        name: error?.name || "Error",
+      });
+      return null;
+    }
+  };
   for (const spec of catalogs) {
     try {
       const rows = await readOfficialCatalog(spec.url);
       const metadata = matchCatalog(rows, stockId, spec.id, spec.name, spec.industry, spec.market);
-      if (metadata) {
-        officialSecurityCache.set(stockId, {
-          expiry: Date.now() + OFFICIAL_SECURITY_CACHE_MS,
-          metadata,
-        });
-        return metadata;
-      }
-    } catch {
+      if (metadata) return acceptMetadata(metadata);
+    } catch (error) {
       anyFailure = true;
+      // Log the source/status only; never log the watched symbol or credentials.
+      console.warn("security_directory_primary_failed", {
+        market: spec.market,
+        status: Number(error?.httpStatus) || null,
+        name: error?.name || "Error",
+      });
+      // On networks that block TPEx (HTTP 403), skip the next TPEx download.
+      if (["TPEX", "EMERGING", "OTC_ETF"].includes(spec.market)) {
+        const backup = await tryBackup();
+        if (backup) return acceptMetadata(backup);
+      }
     }
   }
-  if (anyFailure) throw new Error("Official stock directory not fully available");
+  if (anyFailure) {
+    const backup = await tryBackup();
+    if (backup) return acceptMetadata(backup);
+    throw new Error("Security directory lookup unavailable");
+  }
   return null;
 }
 
@@ -711,12 +816,12 @@ async function changeWatchlist(env, action, stockId, name = "", category = "") {
       try {
         official = await lookupStockMetadata(stockId);
       } catch {
-        return "⚠️ 官方證券基本資料暫時無法驗證，未變更 " + stockId +
+        return "⚠️ 官方證券基本資料暫時無法驗證（備援也未能確認），未變更 " + stockId +
           "。請稍後重試，或明確提供股票名稱與類股。";
       }
       if (!official) {
         return "⛔ 查無 " + stockId +
-          " 的上市 ETF／上市公司／上櫃公司官方基本資料，未新增或修改。";
+          " 的上市 ETF／上市公司／上櫃／興櫃公司基本資料，未新增或修改。";
       }
     }
     expectedName = current?.name || name || official?.name || "";
@@ -1175,7 +1280,7 @@ export default {
         if (command === "/測試") {
           message = "✅ LINE 機器人連線成功！";
         } else if (command === "/版本") {
-          message = "🛠️ stock-line-bot／5.8.3（LINE 新增回覆修正）";
+          message = "🛠️ stock-line-bot／5.8.4（櫃買備援資料源）";
         } else if (command === "/我的ID") {
           message = event.source.userId
             ? "🔐 你的 LINE User ID：" + event.source.userId +

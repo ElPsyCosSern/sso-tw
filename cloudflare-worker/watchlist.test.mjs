@@ -96,8 +96,8 @@ async function simulate(command, opts = {}) {
         catalogDelayUsed = true;
         await new Promise((resolve) => setTimeout(resolve, opts.delayCatalogMs));
       }
-      if (opts.catalogUnavailable) {
-        return responseJson({ error: "official source unavailable" }, 503);
+      if (opts.catalogUnavailable || (opts.blockTpex && u.host === "www.tpex.org.tw")) {
+        return responseJson({ error: "official source unavailable" }, opts.blockTpex ? 403 : 503);
       }
       if (u.pathname.endsWith("/t187ap47_L")) {
         return responseJson([
@@ -118,6 +118,8 @@ async function simulate(command, opts = {}) {
         return responseJson([
           { SecuritiesCompanyCode: "6488", CompanyAbbreviation: "環球晶",
             SecuritiesIndustryCode: "24" },
+          { SecuritiesCompanyCode: "3444", CompanyAbbreviation: "利機",
+            SecuritiesIndustryCode: "29" },
           { SecuritiesCompanyCode: "3260", CompanyAbbreviation: "威剛",
             SecuritiesIndustryCode: "24" },
         ]);
@@ -137,6 +139,46 @@ async function simulate(command, opts = {}) {
         ]);
       }
       throw new Error("Unknown official catalog endpoint");
+    }
+    if (u.host === "api.finmindtrade.com") {
+      calls.push({ type: "finmind", code: u.searchParams.get("data_id") });
+      assert.equal(options.method, "GET");
+      assert.equal(u.pathname, "/api/v4/data");
+      assert.equal(u.searchParams.get("dataset"), "TaiwanStockInfo");
+      assert.equal(options.headers.Authorization, undefined);
+      if (opts.finMindUnavailable) return responseJson({ error: "rate limit" }, 429);
+      const code = u.searchParams.get("data_id");
+      const date = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Taipei", year: "numeric", month: "2-digit", day: "2-digit",
+      }).format(new Date());
+      const rows = {
+        "3444": [
+          { stock_id: "3444", stock_name: "利機", industry_category: "電子通路類",
+            type: "tpex", date: "2026-10-23" },
+          { stock_id: "3444", stock_name: "利機", industry_category: "電子通路業",
+            type: "tpex", date },
+        ],
+        "1260": [
+          { stock_id: "1260", stock_name: "富味鄉", industry_category: "食品工業",
+            type: "emerging", date },
+        ],
+        "1294": [
+          { stock_id: "1294", stock_name: "漢田生技", industry_category: "生技醫療業",
+            type: "emerging", date: "2024-09-25" },
+          { stock_id: "1294", stock_name: "漢田生技", industry_category: "生技醫療業",
+            type: "tpex", date },
+        ],
+        "00687B": [
+          { stock_id: "00687B", stock_name: "國泰20年美債",
+            industry_category: "ETF", type: "tpex", date },
+        ],
+      };
+      const data = structuredClone(rows[code] || []);
+      if (opts.finMindStale) data.forEach((item) => { item.date = "2025-01-01"; });
+      if (opts.finMindConflict && data.length) {
+        data.push({ ...data.at(-1), stock_name: "不一致名稱" });
+      }
+      return responseJson({ msg: "success", status: 200, data });
     }
     if (u.host === "sheets.googleapis.com" && u.pathname.endsWith("/values:batchGet")) {
       assert.equal(options.method, "GET");
@@ -193,7 +235,10 @@ async function simulate(command, opts = {}) {
     throw new Error("Unexpected network call: " + u.origin);
   };
   try {
-    const response = await worker.fetch(signedRequest(
+    const handler = opts.fresh
+      ? (await import("./index.mjs?test=" + encodeURIComponent(opts.fresh))).default
+      : worker;
+    const response = await handler.fetch(signedRequest(
       command, opts.userId === undefined ? adminId : opts.userId, opts.group ?? groupId
     ), config, {
       waitUntil: (promise) => { pending.push(promise); },
@@ -375,7 +420,7 @@ test("/新增 writes no formulas, score or existing signal rows", async () => {
 
 test("/版本 identifies deployed Worker source without Google calls", async () => {
   const { text, calls } = await simulate("/版本");
-  assert.match(text, /5\.8\.3/);
+  assert.match(text, /5\.8\.4/);
   assert.equal(calls.length, 0);
 });
 
@@ -415,7 +460,7 @@ test("/新增 6488 resolves TPEX name and official industry into category", asyn
 test("/新增 unknown ticker fails closed, never appends fake metadata", async () => {
   const result = await simulate("/新增 9999");
   assert.deepEqual(result.rows, original);
-  assert.match(result.text, /查無 9999 的上市 ETF／上市公司／上櫃公司官方基本資料/);
+  assert.match(result.text, /查無 9999 的上市 ETF／上市公司／上櫃／興櫃公司基本資料/);
   assert.equal(result.calls.filter((c) => c.type === "write").length, 0);
 });
 
@@ -590,4 +635,85 @@ test("slow rejected admin operation replies pending instead of asserting success
   assert.match(result.text, /不代表寫入成功/);
   assert.equal(result.calls.filter((call) => call.type === "write").length, 0);
   assert.deepEqual(result.rows, original);
+});
+
+
+test("/新增 3444 uses the official TPEx directory and sets electronic distribution sector", async () => {
+  const { rows, calls, text } = await simulate("/新增 3444", { fresh: "3444-official" });
+  assert.deepEqual(rows.at(-1), ["3444", "利機", "電子通路", "TRUE"]);
+  assert.match(text, /櫃買中心上櫃公司名冊/);
+  assert.equal(calls.filter((call) => call.type === "finmind").length, 0);
+  assert.equal(calls.filter((call) => call.type === "write").length, 1);
+});
+
+test("/新增 3444 falls back safely to free per-code FinMind when TPEx returns 403", async () => {
+  const { rows, calls, text } = await simulate("/新增 3444", {
+    fresh: "3444-403", blockTpex: true,
+  });
+  assert.deepEqual(rows.at(-1), ["3444", "利機", "電子通路", "TRUE"]);
+  assert.match(text, /^✅ 3444 利機（電子通路）/);
+  assert.match(text, /FinMind TaiwanStockInfo（第三方備援/);
+  assert.equal(calls.filter((call) => call.type === "write").length, 1);
+  assert.deepEqual(calls.filter((call) => call.type === "finmind").map((c) => c.code), ["3444"]);
+  assert.deepEqual(calls.filter((call) => call.type === "catalog").map((c) => new URL(c.url).pathname), [
+    "/v1/opendata/t187ap03_L", "/openapi/v1/mopsfin_t187ap03_O",
+  ]);
+});
+
+test("/新增 1260 falls back to FinMind's emerging type if TPEx refuses requests", async () => {
+  const { rows, calls, text } = await simulate("/新增 1260", {
+    fresh: "1260-403", blockTpex: true,
+  });
+  assert.deepEqual(rows.at(-1), ["1260", "富味鄉", "興櫃／食品", "TRUE"]);
+  assert.match(text, /興櫃採議價交易/);
+  assert.match(text, /第三方備援/);
+  assert.deepEqual(calls.filter((call) => call.type === "finmind").map((c) => c.code), ["1260"]);
+  assert.equal(calls.filter((c) => c.type === "write").length, 1);
+});
+
+test("TPEx unavailable and FinMind rate-limited: never writes an unverified symbol", async () => {
+  const { rows, calls, text } = await simulate("/新增 3444", {
+    fresh: "3444-backup-denied", blockTpex: true, finMindUnavailable: true,
+  });
+  assert.deepEqual(rows, original);
+  assert.equal(calls.filter((call) => call.type === "write").length, 0);
+  assert.match(text, /官方證券基本資料暫時無法驗證/);
+});
+
+test("FinMind stale last update cannot authorize Watchlist insertion", async () => {
+  const { rows, calls, text } = await simulate("/新增 3444", {
+    fresh: "3444-stale", blockTpex: true, finMindStale: true,
+  });
+  assert.deepEqual(rows, original);
+  assert.equal(calls.filter((call) => call.type === "write").length, 0);
+  assert.match(text, /官方證券基本資料暫時無法驗證/);
+});
+
+test("FinMind contradictory newest names do not silently pick one", async () => {
+  const { rows, calls, text } = await simulate("/新增 3444", {
+    fresh: "3444-conflict", blockTpex: true, finMindConflict: true,
+  });
+  assert.deepEqual(rows, original);
+  assert.equal(calls.filter((call) => call.type === "write").length, 0);
+  assert.match(text, /官方證券基本資料暫時無法驗證/);
+});
+
+test("a non-manager cannot trigger FinMind fallback or write Sheets", async () => {
+  const { rows, calls, text } = await simulate("/新增 3444", {
+    fresh: "3444-not-admin", blockTpex: true, userId: otherUserId,
+  });
+  assert.deepEqual(rows, original);
+  assert.equal(calls.length, 0);
+  assert.match(text, /只有已設定的管理員/);
+});
+
+
+test("fallback uses latest FinMind market when a stock transferred from emerging to TPEx", async () => {
+  const { rows, calls, text } = await simulate("/新增 1294", {
+    fresh: "1294-transfer-latest", blockTpex: true,
+  });
+  assert.deepEqual(rows.at(-1), ["1294", "漢田生技", "生技醫療", "TRUE"]);
+  assert.doesNotMatch(text, /興櫃採議價交易/);
+  assert.match(text, /FinMind TaiwanStockInfo/);
+  assert.equal(calls.filter((call) => call.type === "finmind").length, 1);
 });
