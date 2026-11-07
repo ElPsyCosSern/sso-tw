@@ -57,9 +57,10 @@ def get_price_history(stock_id: str, years: int = 3) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.rename(columns={"max": "high", "min": "low", "Trading_Volume": "volume"})
-    for col in ["open", "high", "low", "close", "volume"]:
+    for col in ["open", "high", "low", "close", "volume", "Trading_money"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
     return df.sort_values("date").reset_index(drop=True)
 
 

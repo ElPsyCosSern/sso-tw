@@ -36,6 +36,40 @@ def _format_stock_detail(s: dict, show_trend: bool = True) -> list[str]:
     t = s.get("trend", {})
     lines = []
     wr = f"{c['backtest_winrate']*100:.0f}%" if c.get("backtest_winrate") is not None else "N/A"
+    if s.get("strategy_id") == "equity_etf_0050_v1":
+        bt = c.get("backtest_winrate")
+        bt_text = f"{bt*100:.1f}%" if bt is not None else "樣本不足"
+        avg_net = c.get("backtest_avg_net_return")
+        net_text = f"{avg_net*100:+.2f}%" if avg_net is not None else "無"
+        turnover = c.get("turnover20_twd")
+        vol = c.get("annualized_volatility")
+        lines.append(
+            f"*{s['stock_id']} {s['name']}*｜股票型 ETF 專屬策略"
+            f"（{s.get('action', '—')}／條件分數 {s.get('signal_score', '—')}，非預測機率）"
+        )
+        lines.append(f"實際行情日：{s.get('price_date') or '未知'}")
+        if show_trend and t:
+            lines.append(
+                f"趨勢：5日{t.get('chg_5d', 0):+.1f}%／20日{t.get('chg_20d', 0):+.1f}%"
+                f"｜月線{'上' if t.get('above_ma20') else '下'}"
+                f"｜季線{'上' if t.get('above_ma60') else '下'}"
+            )
+        if turnover is not None and vol is not None:
+            lines.append(f"20日均成交金額 {turnover/1e6:,.1f} 百萬元｜年化波動 {vol*100:.1f}%")
+        lines.append(
+            f"分割後價格回測：{c.get('backtest_samples', 0)} 筆不重疊"
+            f"｜扣估計成本後勝率 {bt_text}｜平均每筆 {net_text}"
+        )
+        lines.append(f"條件判斷：{s.get('entry_rule', '暫無可執行訊號')}")
+        if s.get("action") == "BUY":
+            lines.append(
+                f"假設收盤參考 {s['entry_price']}｜風控情境 停損 {s['stop_loss_price']}"
+                f"／目標 {s['target_price']}；建議單一部位上限 {s['position_size_pct']}%"
+            )
+        if s.get("risk_notes"):
+            lines.append("⚠️ " + " / ".join(s["risk_notes"]))
+        return lines
+
     fund = "✅" if c.get("fundamental_pass") else "❌"
 
     lines.append(f"*{s['stock_id']} {s['name']}*  綜合 {s['signal_score']} 分")
@@ -52,9 +86,10 @@ def _format_stock_detail(s: dict, show_trend: bool = True) -> list[str]:
             f"{_trend_emoji(t.get('chg_5d', 0))} 5日{t.get('chg_5d', 0):+.1f}% | 20日{t.get('chg_20d', 0):+.1f}% | "
             f"距高點{t.get('pct_from_high', 0):.0f}% | {ma_status} | {vol_note}"
         )
-    lines.append(
-        f"📌 *明日開盤進場* | 參考價 {s['entry_price']}"
-    )
+    if s.get("stock_id") == "3444":
+        lines.append(f"📌 *上櫃研究參考價* {s['entry_price']}；{s.get('entry_rule', '先觀察流動性')}")
+    else:
+        lines.append(f"📌 *明日開盤進場* | 參考價 {s['entry_price']}")
     lines.append(
         f"停損 {s['stop_loss_price']} (-{CONFIG['stop_loss']*100:.0f}%) / "
         f"目標 {s['target_price']} (+{CONFIG['target_return']*100:.0f}%)"
@@ -76,6 +111,13 @@ def _explain_why(s: dict) -> str:
     """解釋為什麼是 BUY / WATCH / SKIP"""
     c = s.get("components", {})
     reasons = []
+    if s.get("strategy_id") == "equity_etf_0050_v1":
+        if s.get("action") == "BUY":
+            return "ETF 均線／動能／流動性／回測條件通過；下單前仍需核對折溢價"
+        return "ETF 專屬趨勢或歷史驗證不足，暫不提供買進訊號"
+    if s.get("stock_id") == "3444" and not c.get("liquidity_pass", True):
+        reasons.append("上櫃成交金額未達研究門檻")
+
     if not c.get("fundamental_pass"):
         reasons.append("基本面未達標(EPS>5,ROE>15)")
     if c.get("tech_score", 0) < 50:
@@ -192,11 +234,13 @@ def format_messages(
 
     msg1.append("📋 *策略規則*")
     msg1.append(
-        "基本面(EPS>5,ROE>15) + 技術面(均線/布林/KD/MACD) + 3年回測\n"
-        f"綜合 = 基本面30% + 技術30% + 回測40%\n"
-        f"BUY≥65(三關全過) | WATCH≥50\n"
+        "普通股：基本面(EPS>5,ROE>15) + 技術面(均線/布林/KD/MACD) + 3年技術回測\n"
+        f"普通股綜合 = 基本面30% + 技術30% + 回測40%\n"
+        f"普通股 BUY≥65(三關全過) | WATCH≥50\n"
         f"停損{CONFIG['stop_loss']*100:.0f}% / 停利{CONFIG['target_return']*100:.0f}% / 持有{CONFIG['hold_days']}日"
     )
+    if any(s.get("strategy_id") == "equity_etf_0050_v1" for s in signals):
+        msg1.append("0050 ETF：獨立以分割後趨勢、成交金額、波動及扣成本回測判斷；不使用公司 EPS／ROE。")
     messages.append("\n".join(msg1))
 
     # === 第二則：BUY 詳細 ===
@@ -210,12 +254,14 @@ def format_messages(
             msg2.append("")
     else:
         msg2.append("🟢 *BUY: 今日無符合全部條件的標的*")
-        msg2.append("（需基本面+技術面+回測三關全過）")
+        msg2.append("（普通股須通過基本面+技術面+回測；0050 ETF 依專屬策略判斷）")
         msg2.append("")
 
     if watches:
-        top_watches = watches[:8]
-        rest_watches = watches[8:]
+        # Always surface the requested 3444 / 0050 research even in larger watchlists.
+        ordered_watches = sorted(watches, key=lambda s: 0 if s.get("stock_id") in ("3444", "0050") else 1)
+        top_watches = ordered_watches[:8]
+        rest_watches = ordered_watches[8:]
         msg2.append(f"🟡 *WATCH — 接近訊號 TOP {len(top_watches)}*")
         msg2.append("")
         for s in top_watches:
@@ -229,6 +275,22 @@ def format_messages(
                 [f"{s['stock_id']}{s['name']}({s['signal_score']})" for s in rest_watches]
             )
             msg2.append(rest_line)
+            msg2.append("")
+
+    # These two deliverables must remain visible even when screened out:
+    # a low score or missing data is itself an important actionable result.
+    target_skips = [s for s in skips if str(s.get("stock_id")) in ("3444", "0050")]
+    if target_skips:
+        msg2.append("⚪ *3444／0050 未通過篩選（不是買進建議）*")
+        for s in target_skips:
+            if s.get("entry_price") is not None and s.get("signal_score") is not None:
+                msg2.extend(_format_stock_detail(s))
+            else:
+                msg2.append(
+                    f"• {s.get('stock_id', '')} {s.get('name', '')}"
+                    f"｜{s.get('action', '—')}｜資料不足，無法評級"
+                )
+                msg2.append("⚠️ " + " / ".join(s.get("risk_notes", []) or ["請確認資料來源"]))
             msg2.append("")
     messages.append("\n".join(msg2))
 
@@ -257,10 +319,18 @@ def format_messages(
                 f"• *{s['stock_id']} {s['name']}* ({s['action']}, {s['signal_score']}分)"
             )
             msg3.append(f"  {reason}")
-            msg3.append(
-                f"  明日開盤進場（參考 {s['entry_price']}）→ "
-                f"損 {s['stop_loss_price']} / 標 {s['target_price']}"
-            )
+            if s.get("stock_id") in ("0050", "3444"):
+                msg3.append("  " + s.get("entry_rule", "僅供研究觀察"))
+                if s.get("action") == "BUY":
+                    msg3.append(
+                        f"  參考 {s['entry_price']}；情境停損 {s['stop_loss_price']}"
+                        f"／目標 {s['target_price']}（非保證成交價）"
+                    )
+            else:
+                msg3.append(
+                    f"  明日開盤進場（參考 {s['entry_price']}）→ "
+                    f"損 {s['stop_loss_price']} / 標 {s['target_price']}"
+                )
             msg3.append("")
 
     msg3.append("📌 *操作方向*")

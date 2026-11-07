@@ -66,6 +66,10 @@ def apply_instrument_safety_filter(results: list[dict], watchlist: list[dict]) -
         is_emerging = category.startswith("興櫃／")
         if not is_etf and not is_emerging:
             continue
+        # Only the dedicated 0050 ETF model bypasses the legacy EPS/ROE guard.
+        # All other ETFs and emerging-board names remain WATCH-only.
+        if is_etf and stock_id == "0050" and result.get("strategy_id") == "equity_etf_0050_v1":
+            continue
         notes = result.setdefault("risk_notes", [])
         if result.get("action") == "BUY":
             result["action"] = "WATCH"
@@ -83,4 +87,19 @@ def apply_instrument_safety_filter(results: list[dict], watchlist: list[dict]) -
                 result["entry_rule"] = warning
         if warning not in notes:
             notes.append(warning)
+    return downgraded
+
+
+def apply_target_freshness_filter(results: list[dict], today: str) -> int:
+    """Prevent weekend or stale 0050/3444 prices from generating current BUY."""
+    downgraded = 0
+    for signal in results:
+        if signal.get("stock_id") not in ("0050", "3444") or signal.get("action") != "BUY":
+            continue
+        if signal.get("price_date") != today:
+            signal["action"] = "WATCH"
+            signal.setdefault("risk_notes", []).append(
+                "分析使用非當日行情，僅供研究；待下一交易日更新後再評估"
+            )
+            downgraded += 1
     return downgraded

@@ -12,7 +12,8 @@ from .loader import merge_params
 from .reporting import taiwan_today
 
 
-def evaluate(stock_id: str, name: str, strategy: dict | None = None) -> Optional[dict]:
+def evaluate(stock_id: str, name: str, strategy: dict | None = None,
+             *, min_avg_turnover_twd: float = 0) -> Optional[dict]:
     """評估一檔股票。strategy 為策略 dict（含 params），不給就用預設值。"""
     params = merge_params(strategy)
 
@@ -78,16 +79,51 @@ def evaluate(stock_id: str, name: str, strategy: dict | None = None) -> Optional
             action = "WATCH"
         else:
             action = "SKIP"
+        turnover20 = None
+        liquidity_ok = True
+        if min_avg_turnover_twd > 0:
+            # OTC research guard: use the reported TWD trading value, not
+            # share price times a possibly misinterpreted volume unit.
+            if "Trading_money" not in px.columns or len(px) < 20:
+                liquidity_ok = False
+            else:
+                money = pd.to_numeric(px["Trading_money"].iloc[-20:], errors="coerce")
+                if money.notna().sum() < 18 or (money.dropna() <= 0).any():
+                    liquidity_ok = False
+                else:
+                    turnover20 = float(money.mean())
+                    liquidity_ok = turnover20 >= min_avg_turnover_twd
+            if not liquidity_ok and action == "BUY":
+                action = "WATCH"
+                result["risk_notes"].append("上櫃流動性條件未確認，不產生買進訊號")
+            if turnover20 is None:
+                result["risk_notes"].append("缺少可驗證的近20日成交金額，流動性不明")
+            elif not liquidity_ok:
+                result["risk_notes"].append(
+                    f"近20日平均成交金額 {turnover20/1e6:.1f} 百萬元，低於"
+                    f" {min_avg_turnover_twd/1e6:.0f} 百萬元研究門檻"
+                )
+
 
         entry = float(latest["close"])
         stop_price = round(entry * (1 - params["stop_loss"]), 2)
         target_price = round(entry * (1 + params["target_return"]), 2)
         rr = round(params["target_return"] / params["stop_loss"], 2)
-        position_pct = min(2.0 / (params["stop_loss"] * 100) * 100, 20.0)
+        position_pct = min(2.0 / (params["stop_loss"] * 100) * 100,
+                           5.0 if min_avg_turnover_twd > 0 else 20.0)
         entry_rule = (
             f"明日以開盤價進場，停損 -{params['stop_loss']*100:.0f}% / "
             f"停利 +{params['target_return']*100:.0f}%（下方參考價為今日收盤）"
         )
+        if min_avg_turnover_twd > 0:
+            result["risk_notes"].append(
+                "上櫃可能有買賣價差與掛單深度不足；歷史價量回測不等於可按參考價成交"
+            )
+            if action != "BUY":
+                entry_rule = "尚未通過全部財報／趨勢／流動性門檻，先觀察，不代表可於隔日開盤成交"
+            else:
+                entry_rule = "上櫃條件式訊號：次日核對買賣價差與深度，僅考慮限價分批"
+
 
         if bt.get("samples", 0) < 8:
             result["risk_notes"].append(f"回測樣本僅 {bt.get('samples', 0)} 次，統計弱")
@@ -126,6 +162,8 @@ def evaluate(stock_id: str, name: str, strategy: dict | None = None) -> Optional
                 "volume_details": vp["details"],
                 "volume_bonus": vp["bonus"],
                 "volume_verdict": volume_verdict(vp["patterns"]),
+                **({"avg_turnover20_twd": round(turnover20) if turnover20 is not None else None,
+                    "liquidity_pass": liquidity_ok} if min_avg_turnover_twd > 0 else {}),
             },
             "trend": {
                 "chg_5d": round(chg_5d, 2),

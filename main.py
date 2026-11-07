@@ -29,9 +29,13 @@ from stock_strategies.sheet import (
     save_report,
 )
 from stock_strategies.evaluate import evaluate
+from stock_strategies.etf_0050 import evaluate_0050
 from stock_strategies.notify import format_messages
 from stock_strategies.reporting import daily_status, taiwan_today, daily_data_date
-from stock_strategies.market import get_market_state, apply_market_filter, apply_instrument_safety_filter
+from stock_strategies.market import (
+    get_market_state, apply_market_filter, apply_instrument_safety_filter,
+    apply_target_freshness_filter,
+)
 from stock_strategies.night_session import (
     get_night_session,
     apply_night_filter,
@@ -78,7 +82,14 @@ def main():
         sid = str(row["stock_id"])
         name = row.get("name", "")
         print(f"[{i}/{len(watchlist)}] {sid} {name}")
-        r = evaluate(sid, name)
+        if sid == "0050":
+            r = evaluate_0050(name)
+        elif sid == "3444":
+            r = evaluate(sid, name, min_avg_turnover_twd=5_000_000)
+            if r:
+                r["strategy_id"] = "otc_3444_v1"
+        else:
+            r = evaluate(sid, name)
         if r:
             results.append(r)
         time.sleep(0.6)
@@ -87,6 +98,10 @@ def main():
     instrument_downgraded = apply_instrument_safety_filter(results, watchlist)
     if instrument_downgraded:
         print(f"⚠️ ETF／興櫃 {instrument_downgraded} 檔 BUY 改為 WATCH（策略尚未適用）")
+    freshness_downgraded = apply_target_freshness_filter(results, today)
+    if freshness_downgraded:
+        print(f"⚠️ 非當日行情：{freshness_downgraded} 檔 0050／3444 的 BUY 暫列 WATCH")
+
 
     # 4. 套用大盤濾鏡：跌破月線時 BUY 一律降為 WATCH
     downgraded = apply_market_filter(results, market)
