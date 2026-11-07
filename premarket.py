@@ -1,7 +1,7 @@
 """夜盤盤前快報
 
 早上排程（台灣 08:00，夜盤 05:00 收完、開盤 09:00 前）讀昨晚台指期夜盤
-+ 昨日選股訊號，推播今日開盤方向預判與個股順風/逆風對照。
++ 昨日選股訊號，保存今日開盤方向預判與個股順風/逆風對照至 Google Sheets。
 
 執行: uv run python premarket.py
 """
@@ -48,7 +48,7 @@ def main():
 
     # 2. 讀昨日訊號（沿用 14:30 排程寫進 Signals 分頁的結果）
     #    讀 300 筆以涵蓋多日（單日掃描可能就數十筆 SKIP），
-    #    format_premarket 會自動挑「最近一批有 BUY/WATCH」的日期。
+    #    只使用最新訊號日；若當日全為 SKIP，不回頭抓更舊的 BUY/WATCH。
     print("讀取昨日訊號...")
     try:
         signals = read_latest_signals(limit=300)
@@ -59,7 +59,13 @@ def main():
 
     # 3. 保存快報，LINE 查詢時不重新呼叫 FinMind。
     status = premarket_status(night, signals)
-    message = format_premarket(night, signals)
+    if status == "complete":
+        message = format_premarket(night, signals)
+    else:
+        message = (
+            f"⚠️ 盤前報告狀態：{status}。夜盤或前一交易日資料未通過時效驗證，"
+            "本次不提供開盤方向或個股操作建議。"
+        )
     save_report(
         run_id=run_id,
         kind="premarket",

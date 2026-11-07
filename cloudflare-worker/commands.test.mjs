@@ -276,3 +276,29 @@ test("unauthorized groups cannot invoke any of the four commands", async () => {
     assert.equal(accesses.length, 0);
   }
 });
+
+
+test("/個股 supports already percent-formatted Google win rate without multiplying twice", async () => {
+  const data = fixture();
+  data.Signals[2][10] = "62.5%";
+  const { text } = await query("/個股 2330", data);
+  assert.match(text, /歷史回測勝率：62\.5%（樣本 8 次）/);
+  assert.doesNotMatch(text, /6250%|6250\.0%/);
+});
+
+test("/資料測試 requests all Reports so latest report stays correct past row 200", async () => {
+  const data = fixture();
+  const old = report(0, "1", {
+    run_id: "old-2026", data_date: "2026-09-01",
+    generated_at_utc: "2026-09-01T00:00:00Z",
+  });
+  for (let i = 0; i < 230; i++) {
+    data.Reports.splice(1, 0, [...old]);
+  }
+  const { text, accesses } = await query("/資料測試", data);
+  assert.match(text, /最近日報：2026-11-06／stale/);
+  assert.deepEqual(
+    accesses.find((a) => a.type === "sheets").ranges,
+    ["'Watchlist'!A1:E101", "'Signals'!A1:P101", "'Performance'!A1:Q101", "'Reports'!A1:I"],
+  );
+});

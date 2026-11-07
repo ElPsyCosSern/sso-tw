@@ -396,16 +396,17 @@ def format_premarket(night: dict | None, signals: list[dict]) -> str:
     # === 疊加昨日訊號 ===
     bias = night["bias"] if night else "flat"
     tag = tailwind_tag(bias)
-    actionable = [
+    # Never reuse an older BUY/WATCH if the latest daily batch has only SKIP.
+    latest_day = max((str(s.get("date") or "") for s in signals), default="")
+    batch = [
         s for s in signals
-        if str(s.get("action", "")).upper() in ("BUY", "WATCH")
+        if str(s.get("date") or "") == latest_day
+        and str(s.get("action", "")).upper() in ("BUY", "WATCH")
     ]
-    if actionable:
-        latest_day = actionable[0].get("date", "")  # 最新在最前
-        batch = [s for s in actionable if s.get("date", "") == latest_day]
+    if batch:
         buys = [s for s in batch if str(s["action"]).upper() == "BUY"]
         watches = [s for s in batch if str(s["action"]).upper() == "WATCH"]
-        lines.append(f"📋 *昨日訊號 × 夜盤對照* ({latest_day})")
+        lines.append(f"📋 *前一交易日訊號 × 夜盤對照* ({latest_day})")
         for s in (buys + watches)[:12]:
             act = str(s["action"]).upper()
             dot = "🟢" if act == "BUY" else "🟡"
@@ -415,7 +416,7 @@ def format_premarket(night: dict | None, signals: list[dict]) -> str:
             )
         lines.append(f"↳ _{bias_guidance(bias)}_")
     else:
-        lines.append("📋 昨日無 BUY/WATCH 訊號（或尚未跑過選股）")
+        lines.append("📋 前一交易日無 BUY/WATCH 訊號（或尚未跑過選股）")
     lines.append("")
 
     lines.append("💡 _夜盤僅領先參考，開盤後仍以實際量價為準_")

@@ -166,3 +166,89 @@ def test_performance_accepts_blank_first_row_from_sheets(fake_sheet):
     sheet.write_performance([])
     assert ws.row_values(1) == sheet.PERFORMANCE_HEADERS
     assert len(ws.get_all_values()) == 1
+
+
+
+def test_daily_status_rejects_future_and_old_night_sessions():
+    result = [{"stock_id": "2330", "action": "WATCH", "price_date": "2026-11-06"}]
+    watch = [{"stock_id": "2330"}]
+    market = {"close": 30_000, "data_date": "2026-11-06"}
+    assert reporting.daily_status(
+        result, watch, market, {"date": "2026-11-09"}, "2026-11-06"
+    ) == "partial"
+    assert reporting.daily_status(
+        result, watch, market, {"date": "2026-11-01"}, "2026-11-06"
+    ) == "partial"
+    assert reporting.daily_status(
+        result, watch, market, {"date": "2026-11-05"}, "2026-11-06"
+    ) == "complete"
+
+
+def test_premarket_status_rejects_stale_or_weekend_test_signals(monkeypatch):
+    from datetime import datetime as RealDatetime
+
+    class FakeDatetime:
+        @staticmethod
+        def now(tz=None):
+            return RealDatetime(2026, 11, 9, 8, 0, tzinfo=tz)
+
+    monkeypatch.setattr(reporting, "datetime", FakeDatetime)
+    night = {"date": "2026-11-09"}
+    friday = [{"date": "2026-11-06", "price_date": "2026-11-06",
+               "stock_id": "2330", "action": "WATCH"}]
+    assert reporting.premarket_status(night, friday) == "complete"
+    assert reporting.premarket_status({"date": "2026-11-07"}, friday) == "stale"
+    assert reporting.premarket_status({"date": "2026-11-10"}, friday) == "stale"
+    assert reporting.premarket_status(
+        night, [{"date": "2026-11-07", "price_date": "2026-11-06",
+                 "stock_id": "2330", "action": "WATCH"}]
+    ) == "stale"
+    assert reporting.premarket_status(
+        night, [{"date": "2026-11-05", "price_date": "2026-11-05",
+                 "stock_id": "2330", "action": "WATCH"}]
+    ) == "stale"
+    assert reporting.premarket_status(night, []) == "partial"
+
+
+def test_premarket_message_does_not_reuse_old_buy_after_new_skip():
+    from stock_strategies.notify import format_premarket
+    last = [
+        {"date": "2026-11-09", "price_date": "2026-11-09",
+         "stock_id": "2330", "action": "SKIP"},
+        {"date": "2026-11-06", "price_date": "2026-11-06",
+         "stock_id": "0050", "name": "old position", "action": "BUY",
+         "signal_score": "70"},
+    ]
+    message = format_premarket(None, last)
+    assert "前一交易日無 BUY/WATCH" in message
+    assert "0050" not in message
+    assert "old position" not in message
+
+
+def test_premarket_persists_warning_only_when_stale(monkeypatch):
+    import premarket
+
+    monkeypatch.setattr(
+        premarket.os, "environ",
+        {"FINMIND_TOKEN": "dummy", "GOOGLE_SHEET_ID": "dummy",
+         "GOOGLE_CREDS_JSON": "dummy"},
+    )
+    monkeypatch.setattr(premarket, "get_night_session", lambda: {
+        "date": "2026-11-09", "pct": 0.0, "label": "平盤",
+    })
+    monkeypatch.setattr(premarket, "read_latest_signals", lambda limit=300: [
+        {"date": "2026-11-07", "price_date": "2026-11-06",
+         "stock_id": "2330", "action": "BUY"},
+    ])
+    monkeypatch.setattr(premarket, "premarket_status", lambda night, signals: "stale")
+    monkeypatch.setattr(
+        premarket, "format_premarket",
+        lambda night, signals: "BUY 2330 明日開盤進場",
+    )
+    saved = {}
+    monkeypatch.setattr(premarket, "save_report", lambda **kwargs: saved.update(kwargs))
+    premarket.main()
+    assert saved["status"] == "stale"
+    assert saved["kind"] == "premarket"
+    assert "本次不提供開盤方向" in saved["messages"][0]
+    assert "明日開盤進場" not in saved["messages"][0]

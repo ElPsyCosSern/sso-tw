@@ -21,19 +21,43 @@ def daily_status(signals: list[dict], watchlist: list[dict], market: dict, night
     dates = {str(s.get("price_date") or "") for s in signals}
     if dates != {today} or market.get("data_date") != today:
         return "stale"
+    # Night-session records can carry the next session's date (e.g. Friday
+    # night labelled Monday). Never certify a future or old session as current.
+    try:
+        night_age = (date.fromisoformat(today)
+                     - date.fromisoformat(str(night["date"]))).days
+    except (KeyError, TypeError, ValueError):
+        return "partial"
+    if night_age not in (0, 1):
+        return "partial"
     return "complete"
 
 
 def premarket_status(night: dict | None, latest_signals: list[dict]) -> str:
+    """Only call a premarket report complete with today's night data and
+    a genuinely fresh prior-day stock batch (weekend: up to 3 calendar days).
+    """
     if not night:
         return "unavailable"
+    today = datetime.now(TAIPEI).date()
     try:
-        age = (datetime.now(TAIPEI).date() - date.fromisoformat(night["date"])).days
+        night_age = (today - date.fromisoformat(str(night["date"]))).days
     except (KeyError, TypeError, ValueError):
         return "partial"
-    if age < 0 or age > 3:
+    if night_age != 0:
         return "stale"
     if not latest_signals or any(not s.get("date") for s in latest_signals):
+        return "partial"
+    try:
+        latest_date = max(date.fromisoformat(str(s["date"])) for s in latest_signals)
+    except (TypeError, ValueError):
+        return "partial"
+    if (today - latest_date).days not in (1, 2, 3):
+        return "stale"
+    freshest = [s for s in latest_signals if str(s["date"]) == latest_date.isoformat()]
+    if any(str(s.get("price_date") or "") != latest_date.isoformat() for s in freshest):
+        return "stale"
+    if any(s.get("action") == "ERROR" for s in freshest):
         return "partial"
     return "complete"
 

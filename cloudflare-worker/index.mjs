@@ -21,7 +21,7 @@ const DIAGNOSTIC_RANGES = [
   "'Watchlist'!A1:E101",
   "'Signals'!A1:P101",
   "'Performance'!A1:Q101",
-  "'Reports'!A1:I201",
+  "'Reports'!A1:I", // latest commit marker may be beyond row 200
 ];
 
 // Full columns: do not silently truncate results after the first 100 rows.
@@ -382,6 +382,15 @@ function signedPercent(num) {
   return (num > 0 ? "+" : "") + num.toFixed(2) + "%";
 }
 
+function backtestWinratePercent(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const parsed = numericPercent(raw);
+  if (parsed === null) return null;
+  const percent = raw.includes("%") || parsed > 1 ? parsed : parsed * 100;
+  return percent >= 0 && percent <= 100 ? percent : null;
+}
+
 async function individualStockMessage(env, stockId) {
   const batch = await latestBatchForQuery(env, stockId);
   if (!batch) {
@@ -403,9 +412,9 @@ async function individualStockMessage(env, stockId) {
       safeCell(s.target_price || "—", 24));
   }
   if (s.rr_ratio) lines.push("參考風報比：1:" + safeCell(s.rr_ratio, 16));
-  const winrate = numericPercent(s.winrate);
+  const winrate = backtestWinratePercent(s.winrate);
   if (winrate !== null) {
-    lines.push("歷史回測勝率：" + (winrate * 100).toFixed(1) +
+    lines.push("歷史回測勝率：" + winrate.toFixed(1) +
       "%（樣本 " + safeCell(s.samples || "未提供", 12) + " 次）");
   }
   if (s.tech_signals) lines.push("技術訊號：" + safeCell(s.tech_signals, 180));
