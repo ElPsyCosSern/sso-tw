@@ -156,3 +156,13 @@ def test_daily_status_requires_current_prices_and_complete_sources():
     assert reporting.daily_status(base, watch, {}, night, "2026-11-06") == "partial"
     assert reporting.daily_status(base, watch, market, None, "2026-11-06") == "partial"
     assert reporting.daily_status([], watch, market, night, "2026-11-06") == "partial"
+
+
+
+def test_performance_accepts_blank_first_row_from_sheets(fake_sheet):
+    """Google API can return [[]] from a new worksheet before any cells are written."""
+    ws = FakeWorksheet([[]], cols=len(sheet.PERFORMANCE_HEADERS))
+    fake_sheet.sheets["Performance"] = ws
+    sheet.write_performance([])
+    assert ws.row_values(1) == sheet.PERFORMANCE_HEADERS
+    assert len(ws.get_all_values()) == 1

@@ -104,12 +104,15 @@ def main():
     print("寫回 Google Sheet (Signals)...")
     append_signals(results, run_id=run_id)
 
-    # 6. 更新 Performance 成績單（追蹤舊 BUY + 附上今日新 BUY）
+    # 6. 更新 Performance 成績單。休市或來源不完整時不新增 BUY 追蹤。
+    #    避免將週末的測試訊號誤當成正式交易訊號。
+    candidate_status = daily_status(results, watchlist, market, night, today)
+    trackable_signals = results if candidate_status == "complete" else []
     performance_failed = False
     print("更新 Performance 成績單...")
     try:
         existing_perf = read_performance()
-        updated_perf = update_performance(existing_perf, results)
+        updated_perf = update_performance(existing_perf, trackable_signals)
         write_performance(updated_perf)
         stats = perf_summary(updated_perf)
         if stats["count"] > 0:
@@ -127,7 +130,7 @@ def main():
         performance_failed = True
 
     # 7. 保存快照；不推播，LINE 之後按指令讀取。
-    status = daily_status(results, watchlist, market, night, today)
+    status = candidate_status
     if performance_failed:
         status = "partial"
     messages = format_messages(results, watchlist, market=market, night_note=night_note)

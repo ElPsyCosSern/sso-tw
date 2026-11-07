@@ -230,7 +230,10 @@ def write_performance(records: list[dict]):
         )
 
     existing = ws.get_all_values()
-    if existing and existing[0][:len(PERFORMANCE_HEADERS)] != PERFORMANCE_HEADERS:
+    # gspread may return [[]] for a newly-created blank worksheet.
+    # Treat a whitespace-only first row as empty, not a schema conflict.
+    if (existing and any(str(v).strip() for v in existing[0])
+            and existing[0][:len(PERFORMANCE_HEADERS)] != PERFORMANCE_HEADERS):
         raise ValueError("Performance 欄位格式不符合預期；未覆蓋既有資料")
 
     rows = [PERFORMANCE_HEADERS] + [
