@@ -64,6 +64,21 @@ LINE 的群組訊息可能沒有 source.userId；當缺少 ID 或不在白名單
 
 資料源都不需要新增 API Key，也不需要開放原本 Google Sheet 的公開權限。Cloudflare 的五組既有 Secrets 與 LINE_ADMIN_USER_IDS 設定保持不變。
 
+## /新增 無回覆時的診斷（v5.8.1 修正）
+
+先用 /測試 和 /觀察 確認 LINE Webhook、Sheets 唯讀功能是否正常；若 /觀察 已列出 0050，但沒有名稱，代表 0050 已存在、**尚未成功補齊 name／category**，不應再以空白名稱新增另一筆。
+
+- 前一版 auto-lookup 每次同時下載並解碼三份官方名冊，約 2.7 MB；Cloudflare Workers Free 每請求 CPU 預算僅 10 ms，JSON 解碼可能超出並導致 **1102**、沒有任何 LINE 回覆。這是可能原因，必須以 Cloudflare Logs／Metrics 才能確認。
+- v5.8.1 改依代號優先查可能的官方來源，找到資料便立即停止查下一份，像 /新增 0050 只需查證交所 ETF 名冊，不必再解碼上市與上櫃完整資料。
+- 新增 /版本，會在白名單群組回覆 5.8.1，確認 Cloudflare 真的部署此版本。/測試 和 /觀察 都無法辨認部署版本。
+- 如果 /版本 沒有顯示 5.8.1：先檢查 Cloudflare 實際部署版本，以及 LINE Messaging API Webhook endpoint。
+- 如果版本正確但 /新增 沒有回覆：到 Cloudflare Dashboard → Workers & Pages → stock-line-bot → Observability / Logs，查看最近一次 /新增 的 invocation status。exceededCpu / 1102 代表資源限制；JavaScript exception 或 Google Sheets 權限錯誤則須依 Log 修復，**不要公開任何密鑰**。
+- 正式部署前備份舊程式；部署後先測 /版本，再用已存在但名稱空白的 /新增 0050 修復，並再次確認 /觀察 名稱及 Sheets 只有一筆 0050。
+
+參考：
+https://developers.cloudflare.com/workers/platform/limits/
+https://developers.cloudflare.com/workers/observability/errors/
+
 ## 測試與部署驗收
 
 Node.js 22+，無須安裝 npm 套件：

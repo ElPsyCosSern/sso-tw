@@ -2,7 +2,7 @@
  * stock-line-bot — Step 5-7 original research report integration
  *
  * Existing /測試, /群組ID, /資料測試, /選股, /個股, /績效, /觀察
- * Admin-only /新增, /移除; setup command /我的ID (allowed group only)
+ * Admin-only /新增, /移除; setup command /我的ID and /版本 (allowed group only)
  * New /總覽, /建議, /量價, /夜盤, /盤前, /完整報告, /報告 N, /功能
  * All commands are confined to a signed, whitelisted LINE private group.
  *
@@ -550,27 +550,36 @@ async function lookupStockMetadata(stockId) {
   const cached = officialSecurityCache.get(stockId);
   if (cached && cached.expiry > Date.now()) return cached.metadata;
 
-  // Parallel public queries keep the LINE Reply API within its reply-token TTL.
-  const catalogs = [
-    { url: TWSE_ETF_CATALOG, id: "基金代號", name: "基金簡稱", industry: null, market: "ETF" },
-    { url: TWSE_STOCK_CATALOG, id: "公司代號", name: "公司簡稱", industry: "產業別", market: "TWSE" },
-    { url: TPEX_STOCK_CATALOG, id: "SecuritiesCompanyCode", name: "CompanyAbbreviation",
-      industry: "SecuritiesIndustryCode", market: "TPEX" },
-  ];
-  const responses = await Promise.allSettled(catalogs.map(async (spec) => {
-    const rows = await readOfficialCatalog(spec.url);
-    return matchCatalog(rows, stockId, spec.id, spec.name, spec.industry, spec.market);
-  }));
-  const valid = responses.filter((r) => r.status === "fulfilled" && r.value).map((r) => r.value);
-  if (valid.length > 1) throw new Error("Conflicting official stock listings");
-  if (!valid.length) {
-    if (responses.some((r) => r.status === "rejected")) {
-      throw new Error("Official stock directory not fully available");
+  // Avoid decoding three huge official catalogs for every /新增.
+  // Workers Free has a tight CPU budget; 3 parallel JSON parses could exhaust
+  // it and prevent any LINE reply. Only fetch the next directory if no match.
+  const etf = { url: TWSE_ETF_CATALOG, id: "基金代號", name: "基金簡稱", market: "ETF" };
+  const listed = { url: TWSE_STOCK_CATALOG, id: "公司代號", name: "公司簡稱", industry: "產業別", market: "TWSE" };
+  const otc = { url: TPEX_STOCK_CATALOG, id: "SecuritiesCompanyCode",
+    name: "CompanyAbbreviation", industry: "SecuritiesIndustryCode", market: "TPEX" };
+  const catalogs = stockId.startsWith("00")
+    ? [etf, listed, otc]
+    : stockId.startsWith("6")
+      ? [otc, listed, etf]
+      : [listed, otc, etf];
+  let anyFailure = false;
+  for (const spec of catalogs) {
+    try {
+      const rows = await readOfficialCatalog(spec.url);
+      const metadata = matchCatalog(rows, stockId, spec.id, spec.name, spec.industry, spec.market);
+      if (metadata) {
+        officialSecurityCache.set(stockId, {
+          expiry: Date.now() + OFFICIAL_SECURITY_CACHE_MS,
+          metadata,
+        });
+        return metadata;
+      }
+    } catch {
+      anyFailure = true;
     }
-    return null;
   }
-  officialSecurityCache.set(stockId, { expiry: Date.now() + OFFICIAL_SECURITY_CACHE_MS, metadata: valid[0] });
-  return valid[0];
+  if (anyFailure) throw new Error("Official stock directory not fully available");
+  return null;
 }
 
 function metadataIncomplete(current) {
@@ -1114,6 +1123,8 @@ export default {
       } else if (allowedGroupId && groupId === allowedGroupId) {
         if (command === "/測試") {
           message = "✅ LINE 機器人連線成功！";
+        } else if (command === "/版本") {
+          message = "🛠️ stock-line-bot／5.8.1（官方名冊查詢最佳化）";
         } else if (command === "/我的ID") {
           message = event.source.userId
             ? "🔐 你的 LINE User ID：" + event.source.userId +
@@ -1199,6 +1210,7 @@ export default {
                 "/新增 2882－新增／重新啟用（管理員）\n" +
                 "/移除 2882－停用但保留歷史（管理員）\n" +
                 "/我的ID－取得管理員設定用 User ID\n" +
+                "/版本－確認 Worker 是否已更新\n" +
                 "僅供研究參考，所有行情日期請以回覆標示為準。";
             } else {
               const match = command.match(/^\/個股\s+([0-9]{4,6})$/);

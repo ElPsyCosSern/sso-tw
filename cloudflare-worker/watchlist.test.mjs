@@ -186,7 +186,8 @@ test("/新增 2882 resolves official stock name and industry and writes one row"
   assert.deepEqual(rows.at(-1), ["2882", "國泰金", "金融", "TRUE"]);
   assert.match(text, /2882 國泰金（金融） 已新增/);
   assert.match(text, /證交所上市公司名冊/);
-  assert.equal(calls.filter((c) => c.type === "catalog").length, 3);
+  assert.deepEqual(calls.filter((c) => c.type === "catalog").map((c) => new URL(c.url).pathname),
+    ["/v1/opendata/t187ap03_L"]);
   assert.equal(calls.filter((c) => c.type === "write").length, 1);
   assert.ok(calls.filter((c) => c.type === "oauth").some((c) => c.scope.endsWith("/spreadsheets")));
   assert.ok(calls.filter((c) => c.type === "oauth").some((c) => c.scope.endsWith(".readonly")));
@@ -199,10 +200,12 @@ test("/新增 with a name and category uses user-supplied values, not invented l
 });
 
 test("/新增 006208 auto-detects ETF and preserves six-digit code", async () => {
-  const { rows, text } = await simulate("/新增 006208");
+  const { rows, text, calls } = await simulate("/新增 006208");
   assert.deepEqual(rows.at(-1), ["006208", "富邦台50", "ETF", "TRUE"]);
   assert.match(text, /006208 富邦台50（ETF） 已新增/);
   assert.match(text, /證交所 ETF 名冊/);
+  assert.deepEqual(calls.filter((c) => c.type === "catalog").map((c) => new URL(c.url).pathname),
+    ["/v1/opendata/t187ap47_L"]);
 });
 
 test("/新增 already enabled returns idempotent message without any update", async () => {
@@ -333,6 +336,12 @@ test("/新增 writes no formulas, score or existing signal rows", async () => {
 });
 
 
+test("/版本 identifies deployed Worker source without Google calls", async () => {
+  const { text, calls } = await simulate("/版本");
+  assert.match(text, /5\.8\.1/);
+  assert.equal(calls.length, 0);
+});
+
 test("/新增 0050 repairs an already enabled row with blank name and 未分類", async () => {
   const rows = [
     ["stock_id", "name", "category", "enabled"],
@@ -342,6 +351,8 @@ test("/新增 0050 repairs an already enabled row with blank name and 未分類"
   assert.deepEqual(result.rows[1], ["0050", "元大台灣50", "ETF", "TRUE"]);
   assert.match(result.text, /已自動補齊原有觀察清單資料/);
   assert.match(result.text, /證交所 ETF 名冊/);
+  assert.deepEqual(result.calls.filter((c) => c.type === "catalog").map((c) => new URL(c.url).pathname),
+    ["/v1/opendata/t187ap47_L"]);
   assert.equal(result.rows.length, 2);
   assert.equal(result.calls.filter((x) => x.type === "write").length, 2);
 });
@@ -357,9 +368,11 @@ test("/新增 0050 preserves a custom label and fills only missing category", as
 });
 
 test("/新增 6488 resolves TPEX name and official industry into category", async () => {
-  const { rows, text } = await simulate("/新增 6488");
+  const { rows, text, calls } = await simulate("/新增 6488");
   assert.deepEqual(rows.at(-1), ["6488", "環球晶", "半導體", "TRUE"]);
   assert.match(text, /櫃買中心上櫃公司名冊/);
+  assert.deepEqual(calls.filter((c) => c.type === "catalog").map((c) => new URL(c.url).pathname),
+    ["/openapi/v1/mopsfin_t187ap03_O"]);
 });
 
 test("/新增 unknown ticker fails closed, never appends fake metadata", async () => {
