@@ -26,9 +26,11 @@ from stock_strategies.sheet import (
     append_signals,
     read_performance,
     write_performance,
+    save_report,
 )
 from stock_strategies.evaluate import evaluate
-from stock_strategies.notify import send_telegram, format_messages
+from stock_strategies.notify import format_messages
+from stock_strategies.reporting import daily_status, taiwan_today, daily_data_date
 from stock_strategies.market import get_market_state, apply_market_filter
 from stock_strategies.night_session import (
     get_night_session,
@@ -40,8 +42,6 @@ from stock_strategies.performance import update_performance, summary as perf_sum
 
 REQUIRED_ENV = [
     "FINMIND_TOKEN",
-    "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_CHAT_ID",
     "GOOGLE_SHEET_ID",
     "GOOGLE_CREDS_JSON",
 ]
@@ -52,6 +52,9 @@ def main():
     if missing:
         print(f"❌ 缺少環境變數: {missing}", file=sys.stderr)
         sys.exit(1)
+
+    today = taiwan_today()
+    run_id = f"daily-{today}-{os.environ.get('GITHUB_RUN_ID', 'manual')}"
 
     # 1. 讀取 watchlist
     print(f"[{datetime.now()}] 讀取 watchlist...")
@@ -99,9 +102,10 @@ def main():
 
     # 5. 寫回 Signals 分頁
     print("寫回 Google Sheet (Signals)...")
-    append_signals(results)
+    append_signals(results, run_id=run_id)
 
     # 6. 更新 Performance 成績單（追蹤舊 BUY + 附上今日新 BUY）
+    performance_failed = False
     print("更新 Performance 成績單...")
     try:
         existing_perf = read_performance()
@@ -120,18 +124,25 @@ def main():
     except Exception as e:
         print(f"⚠️ Performance 追蹤失敗: {e}", file=sys.stderr)
         stats = None
+        performance_failed = True
 
-    # 7. 發送 Telegram
-    print("發送 Telegram...")
-    for msg in format_messages(results, watchlist, market=market, night_note=night_note):
-        send_telegram(msg)
-        time.sleep(0.5)
-
-    # 8. 若有累積的成績單，額外推一則摘要
+    # 7. 保存快照；不推播，LINE 之後按指令讀取。
+    status = daily_status(results, watchlist, market, night, today)
+    if performance_failed:
+        status = "partial"
+    messages = format_messages(results, watchlist, market=market, night_note=night_note)
     if stats and stats["count"] >= 5:
-        send_telegram(_format_perf_message(stats))
-
-    print("✅ 完成")
+        messages.append(_format_perf_message(stats))
+    save_report(
+        run_id=run_id,
+        kind="daily",
+        data_date=daily_data_date(results),
+        status=status,
+        signal_count=len(results),
+        error_count=sum(s.get("action") == "ERROR" for s in results),
+        messages=messages,
+    )
+    print(f"✅ 報告已寫入 Sheets（{status}；run_id={run_id}）")
 
 
 def _format_perf_message(stats: dict) -> str:

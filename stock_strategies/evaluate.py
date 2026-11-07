@@ -9,6 +9,7 @@ from .indicators import add_indicators, tech_score_at
 from .backtest import backtest
 from .volume import detect_patterns, verdict as volume_verdict
 from .loader import merge_params
+from .reporting import taiwan_today
 
 
 def evaluate(stock_id: str, name: str, strategy: dict | None = None) -> Optional[dict]:
@@ -18,7 +19,7 @@ def evaluate(stock_id: str, name: str, strategy: dict | None = None) -> Optional
     result = {
         "stock_id": stock_id,
         "name": name,
-        "date": datetime.now().strftime("%Y-%m-%d"),
+        "date": taiwan_today(),
         "strategy_id": (strategy or {}).get("id", "default"),
         "risk_notes": [],
     }
@@ -42,6 +43,7 @@ def evaluate(stock_id: str, name: str, strategy: dict | None = None) -> Optional
 
         px = add_indicators(px)
         latest = px.iloc[-1]
+        price_date = pd.to_datetime(latest["date"]).strftime("%Y-%m-%d")
         ts = tech_score_at(latest, params)
         bt = backtest(px, params)
 
@@ -134,6 +136,7 @@ def evaluate(stock_id: str, name: str, strategy: dict | None = None) -> Optional
                 "above_ma60": bool(above_ma60),
             },
             "entry_price": entry,
+            "price_date": price_date,
             "stop_loss_price": stop_price,
             "target_price": target_price,
             "risk_reward_ratio": rr,

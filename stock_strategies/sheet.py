@@ -1,70 +1,120 @@
 import os
 import json
+from datetime import datetime, timezone
 
 import gspread
 from google.oauth2.service_account import Credentials
 
 
+SIGNAL_HEADERS = [
+    "date", "stock_id", "name", "action", "signal_score",
+    "entry_price", "stop_loss_price", "target_price",
+    "rr_ratio", "position_pct", "winrate", "samples",
+    "tech_signals", "risk_notes", "run_id", "price_date",
+]
+
+REPORT_HEADERS = [
+    "run_id", "kind", "data_date", "generated_at_utc",
+    "status", "signal_count", "error_count", "part", "content",
+]
+
+
+def _records(ws) -> list[dict]:
+    """使用原始文字讀取，避免 Google Sheets 的 0050 被轉成數字 50。"""
+    values = ws.get_all_values()
+    if not values:
+        return []
+    headers = [str(v).strip() for v in values[0]]
+    return [
+        {header: str(row[i]) if i < len(row) else "" for i, header in enumerate(headers)}
+        for row in values[1:]
+        if any(str(value).strip() for value in row)
+    ]
+
+
+def _ensure_sheet(sh, title: str, headers: list[str]):
+    try:
+        ws = sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows=1000, cols=len(headers))
+
+    existing = [h.strip() for h in ws.row_values(1)]
+    if existing and existing != headers[:len(existing)]:
+        raise ValueError(f"{title} 欄位格式不符合預期；未自動覆蓋既有資料")
+    if len(existing) < len(headers):
+        if ws.col_count < len(headers):
+            ws.add_cols(len(headers) - ws.col_count)
+        ws.update(
+            range_name=f"A1:{gspread.utils.rowcol_to_a1(1, len(headers))}",
+            values=[headers],
+            value_input_option="RAW",
+        )
+    return ws
+
+
 def get_gsheet():
     creds_json = os.environ["GOOGLE_CREDS_JSON"]
     creds_dict = json.loads(creds_json)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
     return gc.open_by_key(os.environ["GOOGLE_SHEET_ID"])
 
 
 def read_watchlist() -> list[dict]:
-    """從 Google Sheet Watchlist 分頁讀股票清單"""
-    sh = get_gsheet()
-    ws = sh.worksheet("Watchlist")
-    rows = ws.get_all_records()
-    enabled = [
-        r for r in rows
-        if str(r.get("enabled", "")).upper() in ("TRUE", "1", "YES")
+    """從 Watchlist 讀取股票清單，保留 ETF 代號的前導零。"""
+    ws = get_gsheet().worksheet("Watchlist")
+    return [
+        r for r in _records(ws)
+        if r.get("stock_id", "").strip()
+        and r.get("enabled", "").strip().upper() in ("TRUE", "1", "YES")
     ]
-    return enabled
 
 
-def append_signals(signals: list[dict]):
-    """把結果寫回 Signals 分頁"""
+def append_signals(signals: list[dict], *, run_id: str):
+    """儲存一批選股結果；同一 run_id + stock_id 重試時覆寫，不重複新增。"""
     if not signals:
         return
-    sh = get_gsheet()
-    try:
-        ws = sh.worksheet("Signals")
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title="Signals", rows=1000, cols=20)
-        ws.append_row([
-            "date", "stock_id", "name", "action", "signal_score",
-            "entry_price", "stop_loss_price", "target_price",
-            "rr_ratio", "position_pct", "winrate", "samples",
-            "tech_signals", "risk_notes"
-        ])
+    if not run_id:
+        raise ValueError("run_id 不可為空")
 
-    rows = []
+    ws = _ensure_sheet(get_gsheet(), "Signals", SIGNAL_HEADERS)
+    values = ws.get_all_values()
+    existing = {}
+    for row_number, row in enumerate(values[1:], start=2):
+        if len(row) >= len(SIGNAL_HEADERS) and row[14] and row[1]:
+            existing[(row[14], row[1])] = row_number
+
+    updates, additions, seen = [], [], set()
     for s in signals:
+        sid = str(s.get("stock_id", "")).strip()
+        if not sid or sid in seen:
+            raise ValueError(f"同一批次股票代號缺漏或重複：{sid}")
+        seen.add(sid)
         c = s.get("components", {})
-        rows.append([
-            s.get("date", ""),
-            s.get("stock_id", ""),
-            s.get("name", ""),
-            s.get("action", ""),
-            s.get("signal_score", ""),
-            s.get("entry_price", ""),
-            s.get("stop_loss_price", ""),
-            s.get("target_price", ""),
-            s.get("risk_reward_ratio", ""),
-            s.get("position_size_pct", ""),
-            c.get("backtest_winrate", ""),
-            c.get("backtest_samples", ""),
+        row = [
+            s.get("date", ""), sid, s.get("name", ""), s.get("action", ""),
+            s.get("signal_score", ""), s.get("entry_price", ""),
+            s.get("stop_loss_price", ""), s.get("target_price", ""),
+            s.get("risk_reward_ratio", ""), s.get("position_size_pct", ""),
+            c.get("backtest_winrate", ""), c.get("backtest_samples", ""),
             ", ".join(c.get("tech_signals", [])),
             " / ".join(s.get("risk_notes", [])),
-        ])
-    ws.append_rows(rows)
+            run_id, s.get("price_date", ""),
+        ]
+        row_number = existing.get((run_id, sid))
+        if row_number is not None:
+            updates.append({
+                "range": f"A{row_number}:P{row_number}",
+                "values": [row],
+            })
+        else:
+            additions.append(row)
+
+    if updates:
+        ws.batch_update(updates, value_input_option="RAW")
+    if additions:
+        ws.append_rows(additions, value_input_option="RAW")
 
 
 def _ensure_watchlist_headers(ws) -> list[str]:
@@ -96,7 +146,7 @@ def add_to_watchlist(stock_id: str, name: str = "") -> dict:
     name_col = headers.index("name") + 1 if "name" in headers else None
     en_col = headers.index("enabled") + 1
 
-    rows = ws.get_all_records()
+    rows = _records(ws)
     for i, r in enumerate(rows, start=2):  # row 1 是 header
         if str(r.get("stock_id", "")).strip() == str(stock_id).strip():
             current = str(r.get("enabled", "")).upper()
@@ -132,7 +182,7 @@ def remove_from_watchlist(stock_id: str) -> dict:
         return {"status": "no_enabled_column"}
     en_col = headers.index("enabled") + 1
 
-    rows = ws.get_all_records()
+    rows = _records(ws)
     for i, r in enumerate(rows, start=2):
         if str(r.get("stock_id", "")).strip() == str(stock_id).strip():
             ws.update_cell(i, en_col, "FALSE")
@@ -141,19 +191,13 @@ def remove_from_watchlist(stock_id: str) -> dict:
 
 
 def read_latest_signals(limit: int = 50) -> list[dict]:
-    """從 Signals 分頁讀最近 N 筆紀錄（依 row 順序，最後 N 筆）。
-
-    若該分頁不存在 → 回空 list（代表還沒跑過）
-    """
-    sh = get_gsheet()
+    """讀取最新訊號，保留原始股票代號文字。"""
     try:
-        ws = sh.worksheet("Signals")
+        ws = get_gsheet().worksheet("Signals")
     except gspread.WorksheetNotFound:
         return []
-    rows = ws.get_all_records()
-    if not rows:
-        return []
-    return rows[-limit:][::-1]  # 最新的在最前面
+    rows = _records(ws)
+    return rows[-limit:][::-1] if limit > 0 else []
 
 
 PERFORMANCE_HEADERS = [
@@ -166,30 +210,109 @@ PERFORMANCE_HEADERS = [
 
 
 def read_performance() -> list[dict]:
-    """讀取 Performance 分頁的所有追蹤紀錄（若尚未建立則回空 list）"""
-    sh = get_gsheet()
+    """讀取 Performance 的現有追蹤紀錄（保留代號前導零）。"""
     try:
-        ws = sh.worksheet("Performance")
+        ws = get_gsheet().worksheet("Performance")
     except gspread.WorksheetNotFound:
         return []
-    return ws.get_all_records()
+    return _records(ws)
 
 
 def write_performance(records: list[dict]):
-    """整張 Performance 分頁清空重寫（紀錄數不多，效率 OK）"""
+    """單次覆寫資料區，不先清空工作表；失敗時避免留下空白成績單。"""
     sh = get_gsheet()
     try:
         ws = sh.worksheet("Performance")
-        ws.clear()
     except gspread.WorksheetNotFound:
-        rows_alloc = max(2000, len(records) + 100)
         ws = sh.add_worksheet(
-            title="Performance", rows=rows_alloc, cols=len(PERFORMANCE_HEADERS)
+            title="Performance", rows=max(2000, len(records) + 100),
+            cols=len(PERFORMANCE_HEADERS),
         )
 
-    ws.append_row(PERFORMANCE_HEADERS)
-    if not records:
-        return
+    existing = ws.get_all_values()
+    if existing and existing[0][:len(PERFORMANCE_HEADERS)] != PERFORMANCE_HEADERS:
+        raise ValueError("Performance 欄位格式不符合預期；未覆蓋既有資料")
 
-    rows = [[r.get(h, "") for h in PERFORMANCE_HEADERS] for r in records]
-    ws.append_rows(rows)
+    rows = [PERFORMANCE_HEADERS] + [
+        [r.get(h, "") for h in PERFORMANCE_HEADERS] for r in records
+    ]
+    old_count = len(existing)
+    total_count = max(len(rows), old_count)
+    if ws.row_count < total_count:
+        ws.add_rows(total_count - ws.row_count)
+    rows.extend([[""] * len(PERFORMANCE_HEADERS) for _ in range(total_count - len(rows))])
+    ws.update(
+        range_name=f"A1:Q{total_count}", values=rows, value_input_option="RAW"
+    )
+
+
+
+def save_report(
+    *,
+    run_id: str,
+    kind: str,
+    data_date: str,
+    status: str,
+    signal_count: int,
+    error_count: int,
+    messages: list[str],
+):
+    """先儲存報告分段，最後才寫完成標記，避免 LINE 讀到未完成批次。
+
+    part=0 是提交標記；每個完整的文字部分存一列（不超過 Sheets 儲存格限制）。
+    """
+    if not run_id or kind not in ("daily", "premarket"):
+        raise ValueError("無效的 run_id 或報告種類")
+    if status not in ("complete", "partial", "stale", "unavailable"):
+        raise ValueError("無效的報告狀態")
+
+    parts = []
+    for message in messages:
+        text = str(message)
+        # Google Sheets 單一儲存格最多 50,000 字元；保守限制 20,000。
+        if not text:
+            continue
+        parts.extend(text[i:i + 20000] for i in range(0, len(text), 20000))
+
+    ws = _ensure_sheet(get_gsheet(), "Reports", REPORT_HEADERS)
+    existing = ws.get_all_values()
+    indexed = {}
+    for row_number, row in enumerate(existing[1:], start=2):
+        if len(row) >= 8 and row[0] and row[1] and row[7]:
+            indexed[(row[0], row[1], str(row[7]))] = row_number
+
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    rows = [
+        [run_id, kind, data_date, stamp, status,
+         signal_count, error_count, i, text]
+        for i, text in enumerate(parts, start=1)
+    ]
+    # 提交標記必須在所有內容已確認寫入後才建立。
+    commit = [
+        run_id, kind, data_date, stamp, status,
+        signal_count, error_count, 0, str(len(parts)),
+    ]
+
+    def upsert(items):
+        updates, additions = [], []
+        for row in items:
+            key = (run_id, kind, str(row[7]))
+            existing_row = indexed.get(key)
+            if existing_row:
+                updates.append({"range": f"A{existing_row}:I{existing_row}", "values": [row]})
+            else:
+                additions.append(row)
+        if updates:
+            ws.batch_update(updates, value_input_option="RAW")
+        if additions:
+            ws.append_rows(additions, value_input_option="RAW")
+
+    # 如果同批次需要重試，先移除舊的完成標記，避免還沒寫完就能被查到。
+    marker_row = indexed.get((run_id, kind, "0"))
+    if marker_row:
+        ws.update(
+            range_name=f"E{marker_row}", values=[["writing"]],
+            value_input_option="RAW",
+        )
+    upsert(rows)
+    upsert([commit])

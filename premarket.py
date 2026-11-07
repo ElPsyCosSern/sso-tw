@@ -17,14 +17,13 @@ except ImportError:
     pass
 
 from stock_strategies.night_session import get_night_session
-from stock_strategies.sheet import read_latest_signals
-from stock_strategies.notify import send_telegram, format_premarket
+from stock_strategies.sheet import read_latest_signals, save_report
+from stock_strategies.notify import format_premarket
+from stock_strategies.reporting import premarket_status, taiwan_today
 
 
 REQUIRED_ENV = [
     "FINMIND_TOKEN",
-    "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_CHAT_ID",
     "GOOGLE_SHEET_ID",
     "GOOGLE_CREDS_JSON",
 ]
@@ -35,6 +34,9 @@ def main():
     if missing:
         print(f"❌ 缺少環境變數: {missing}", file=sys.stderr)
         sys.exit(1)
+
+    today = taiwan_today()
+    run_id = f"premarket-{today}-{os.environ.get('GITHUB_RUN_ID', 'manual')}"
 
     # 1. 取得台指期夜盤
     print(f"[{datetime.now()}] 取得台指期夜盤...")
@@ -55,10 +57,19 @@ def main():
         signals = []
     print(f"  → {len(signals)} 筆")
 
-    # 3. 發送 Telegram 盤前快報
-    print("發送 Telegram 盤前快報...")
-    send_telegram(format_premarket(night, signals))
-    print("✅ 完成")
+    # 3. 保存快報，LINE 查詢時不重新呼叫 FinMind。
+    status = premarket_status(night, signals)
+    message = format_premarket(night, signals)
+    save_report(
+        run_id=run_id,
+        kind="premarket",
+        data_date=night["date"] if night else today,
+        status=status,
+        signal_count=len(signals),
+        error_count=int(night is None),
+        messages=[message],
+    )
+    print(f"✅ 盤前報告已寫入 Sheets（{status}；run_id={run_id}）")
 
 
 if __name__ == "__main__":
